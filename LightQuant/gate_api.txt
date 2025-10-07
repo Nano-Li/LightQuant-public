@@ -1,0 +1,7 @@
+# api info
+
+api_key= your-api-key
+api_secret= your-api-secret
+user_id= your-id
+
+# end
