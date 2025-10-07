@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
 
 from LightQuant.Executor import Executor
 from LightQuant.Analyzer import Analyzer
-from .TradeUI import TradeUI, RunningStgColumn, StoppedStgColumn
+from .TradeUI import TradeUI, RunningStgColumn, StoppedStgColumn, SubAccountColumn, MarketMakerUI
 from .OtherWidgets import CreateUIWindow, InputApiDialog, WrongParamInputDialog, ParamRefInfoWindow
 from .stg_param_widgets.BaseParamWindow import ParamWidget
 from .WindowToken import WindowToken as WTOKEN
@@ -34,14 +34,22 @@ from LightQuant.strategy.GateAnalyzer.ArithmeticGridMargin import ArithmeticGrid
 from LightQuant.strategy.GateAnalyzer.ArithmeticGridFutures import ArithmeticGridAnalyzerFutures
 from LightQuant.strategy.GateAnalyzer.HighFreqTriggerGridFuturesT import HighFreqTriggerGridAnalyzerFuturesT
 from LightQuant.strategy.GateAnalyzer.NonlinearStairGridFuturesBeta import NonlinearStairGridAnalyzerFuturesBeta
+from LightQuant.strategy.GateAnalyzer.OptimalGridSeekerFutures import OptimalGridSeekerAnalyzerFutures
 from LightQuant.strategy.GateAnalyzer.SmartGridFutures import SmartGridAnalyzerFutures
-from LightQuant.strategy.GateAnalyzer.SmartFundGridFutures import SmartFundGridAnalyzerFutures
+from LightQuant.strategy.GateAnalyzer.FakeGridFutures import FakeGridAnalyzerFutures
+
+from LightQuant.strategy.GateMarketMaker.SmartGridMMFutures import SmartGridMarketMakerAnalyzer
+from LightQuant.strategy.GateMarketMaker.TestMMFutures import TestMarketMakerAnalyzer
+from LightQuant.strategy.GateMarketMaker.Operator import Operator
 # todo: 只有此处导入所有策略参数输入窗口，添加新策略时需要修改此处
 from .stg_param_widgets.ArithmeticGridParam import ArithmeticGridParam
 # from .stg_param_widgets.StairGridParam import StairGridParam
 from .stg_param_widgets.ArithmeticTriggerGridParam import ArithmeticTriggerGridParam
 from .stg_param_widgets.NonlinearStairGridParam import NonlinearStairGridParam
 from .stg_param_widgets.SmartGridParam import SmartGridParam
+from .stg_param_widgets.SmartGridMMParam import SmartGridMarketMakerParam
+from .stg_param_widgets.MarketMakerGridParam import MarketMakerGridParam
+from .stg_param_widgets.FakeGridParam import FakeGridParam
 
 
 class CreatingUIWindow(CreateUIWindow):
@@ -63,8 +71,9 @@ class CreatingUIWindow(CreateUIWindow):
         self.api_selector.addItem('Gate 现货')
         self.api_selector.addItem('Gate 合约')
         self.api_selector.addItem('Gate 合约-复原')
+        self.api_selector.addItem('Gate 做市策略')
 
-    def return_executor_instance(self) -> tuple[Executor, bool]:
+    def return_executor_instance(self) -> tuple[Executor, int]:
         """
         返回所选择的api接口 实例，以及是否是复原策略ui
         :return:
@@ -72,11 +81,15 @@ class CreatingUIWindow(CreateUIWindow):
         # print('返回函数被调用一次')
         # todo: 只有此处关联所有执行者类，添加api接口时需要修改此处
         if self.api_selector.currentIndex() == 0:
-            return GateMarginExecutor(), False
+            return GateMarginExecutor(), 0
         elif self.api_selector.currentIndex() == 1:
-            return GateFuturesExecutor(), False
+            return GateFuturesExecutor(), 0
         elif self.api_selector.currentIndex() == 2:
-            return GateFuturesExecutor(), True
+            return GateFuturesExecutor(), 1
+        elif self.api_selector.currentIndex() == 3:
+            new_executor = GateFuturesExecutor()
+            new_executor.NAME = 'Gate 做市'
+            return new_executor, 2
         else:
             print('未定义的选择')
 
@@ -426,10 +439,10 @@ class TradingUI(TradeUI):
         # todo: 临时用的方法，更新策略时也需更新
         self.stg_selector.addItem('基础网格')
         self.stg_selector.addItem('挂单触发网格')
-        self.stg_selector.addItem('智能调仓Beta旧')
-        # self.stg_selector.addItem('最优网格旧策略')
+        self.stg_selector.addItem('智能调仓Beta')
+        self.stg_selector.addItem('最优网格策略')
         self.stg_selector.addItem('智能调仓网格')
-        self.stg_selector.addItem('新-智能资金调仓')
+        self.stg_selector.addItem('内存测试')
 
     def _pop_connect_api_dialog(self):
         self.api_input_dialog = InputApiDialog()
@@ -542,16 +555,25 @@ class TradingUI(TradeUI):
             if self.executor.NAME == 'Gate 现货':
                 return ArithmeticGridAnalyzerMargin(), ArithmeticGridParam()
             elif self.executor.NAME == 'Gate 合约':
-                return SmartGridAnalyzerFutures(), SmartGridParam()
+                return OptimalGridSeekerAnalyzerFutures(), NonlinearStairGridParam()
         elif self.stg_selector.currentIndex() == 4:
             if self.executor.NAME == 'Gate 现货':
                 return ArithmeticGridAnalyzerMargin(), ArithmeticGridParam()
             elif self.executor.NAME == 'Gate 合约':
-                return SmartFundGridAnalyzerFutures(), SmartGridParam()
+                return SmartGridAnalyzerFutures(), SmartGridParam()
+        elif self.stg_selector.currentIndex() == 5:
+            if self.executor.NAME == 'Gate 现货':
+                return ArithmeticGridAnalyzerMargin(), ArithmeticGridParam()
+            elif self.executor.NAME == 'Gate 合约':
+                return FakeGridAnalyzerFutures(), FakeGridParam()
         else:
             print('未定义的选项')
 
     def _create_stg(self):
+        """
+        点击创建策略时调用的函数
+        :return:
+        """
         # todo: 该逻辑下暂时没有中途保存功能，如果中途x掉则会删除实例，不保存已输入参数
         new_analyzer_instance, new_param_window = self._return_analyzer_instance()
         # analyzer 首先单向绑定 executor 以获取信息
@@ -565,6 +587,9 @@ class TradingUI(TradeUI):
         # del new_param_window
 
     def _shutdown_all_stg(self):
+        # todo: temp method
+        # noinspection PyUnresolvedReferences
+        # asyncio.create_task(self.executor.temp_place_order())
         pass
 
     def _disconnect_api(self):
@@ -590,7 +615,7 @@ class TradingUI(TradeUI):
         self._new_running_col.set_column_name()
         self._running_column_layout.addWidget(self._new_running_col)
         self._running_stg_cols[stg_token] = self._new_running_col
-        # todo: work here, add layout
+
         self._add_detail_browser(stg_num=stg_token, browser=self._new_running_col.detail_browser)
         self._add_order_browser(stg_num=stg_token, browser=self._new_running_col.order_browser)
         # 不需要将signal.connect, 因为创建col实例时已经连接过一次了
@@ -842,7 +867,7 @@ class TradingRecoverUI(TradingUI):
                 self._new_running_col.signal_emitter_col.connect(self._signal_receiver_running_col)
 
                 self._add_running_stg_col()
-                time.sleep(0.8)
+                time.sleep(0.5)
                 self._new_running_col.set_running_state()
                 # 随后重启策略
                 successfully_restarted = await new_analyzer_instance.restart(stg_info=each_stg_data, save_file_name=each_json_file)
@@ -862,6 +887,578 @@ class TradingRecoverUI(TradingUI):
 
         # 当所有操作完成以后，允许用户操作
         self._enable_window()
+
+
+class SubAccountCol(SubAccountColumn):
+    """
+    高频做市策略专用的策略栏，临时使用该方法，框架做出改变
+    策略使用多个executor连接多个子账号
+    """
+    signal_emitter: pyqtBoundSignal = pyqtSignal(str)
+
+    def __init__(self, account_series: str = None):
+        super().__init__(account_series)
+
+        self.detail_browser: DetailBrowser = DetailBrowser()
+        self.order_browser: OrderBrowser = OrderBrowser()
+
+    def _column_select(self) -> None:
+        if self._is_selected:
+            self.turn_unselected_frame_mode()
+            self.signal_emitter.emit(WTOKEN.encode_stg_num(self.account_series, WTOKEN.COLUMN_UNSELECTED))
+        else:
+            self.turn_selected_frame_mode()
+            self.signal_emitter.emit(WTOKEN.encode_stg_num(self.account_series, WTOKEN.COLUMN_SELECTED))
+
+    def update_account_info(self, showing_info: str) -> None:
+        self.detail_browser.setText(showing_info)
+
+    def update_account_orders(self, appending_info: str) -> None:
+        self.order_browser.append(appending_info)
+
+
+class TradingMarketMakerUI(MarketMakerUI):
+    """
+    多子账号高频做市策略的交易UI，暂时基于常规UI开发
+    多子账号做市流程：
+        1. 连接主账户api
+        2. 设定做市策略参数，计算相关参考信息
+        3. 创建或者使用子账号，并划转资金(平均分配)
+        4. 使用做市框架开始交易
+    """
+
+    MM_data_path = 'market_maker_statistics'
+    file_name = 'sub_accounts.json'
+
+    MM_strategy_api_name = 'MM_strategy'
+
+    sub_accounts_data: dict = {
+        130074: {
+            'name': '',
+            'api_key': None,
+            'api_secret': None,
+            'ip_permission': []
+        }
+    }
+
+    # noinspection PyTypeChecker
+    def __init__(self, bound_executor: Executor):
+        # 注意这里的executor是用于与主账户通信的执行者，主账户只负责分配资金和账户，不参与交易。实际交易需要定义额外执行者列表
+        super().__init__()
+        # self.btn_initialize.clicked.connect(self._initialize_task)
+        # 创建确认框，但不立即显示
+        self.confirm_box = QMessageBox()
+        self.confirm_box.setWindowTitle('确认参数')
+        self.confirm_box.setText('是否确认参数?\n\n确定后无法更改!\n并且立刻创建子账号和API')
+        self.confirm_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+
+        self.main_analyzer: Analyzer = None
+        self.main_executor = bound_executor
+        self.param_window: ParamWidget = None
+        self.fake_running_col: RunningStgCol = None
+
+        self.ref_info_window = ParamRefInfoWindow()
+        self.ref_info_window.move(960, 160)
+        # 只需要移动一次，后续位置由用户自己给定
+        self.param_window_moved = False
+
+        # 存储layout 中的 column
+        self._running_column_layout = self.account_window.column_layout
+
+        self._detail_browser_widget = self.detail_region.all_browsers
+        self._order_browser_widget = self.order_region.all_browsers
+        # # 存储所有 column, 使用与executor相同的策略识别号
+        # self._running_stg_cols: dict[str, RunningStgCol] = {}
+        # self._stopped_stg_cols: dict[str, StoppedStgCol] = {}
+        self._sub_accounts_cols: dict[str, SubAccountCol] = {}
+        # 存储所有右边信息 TextBrowser()
+        self._detail_browsers: dict[str, DetailBrowser] = {}
+        self._order_browsers: dict[str, OrderBrowser] = {}
+        # 工具变量，知晓当前选中的 column
+        self._selected_acc_col: str = None
+        # 临时存储变量，在新建策略时暂时保存实例
+        # self._new_running_col: RunningStgCol = None
+
+        self.api_input_dialog: InputApiDialog = None
+
+        self.api_connected: bool = False
+        self.is_stg_created: bool = False
+        self.is_initialized: bool = False
+        self.is_stg_running: bool = False
+        self.is_stg_stopped: bool = False
+
+        self._set_selection()
+        self._add_detail_browser('init', DetailBrowser())
+        self._add_order_browser('init', OrderBrowser())
+        self._update_btn_status()
+
+        self.sub_account_num: int = 0
+        self.sub_executor_list: list[Executor] = []
+        # 存储并写入子账号信息
+        self._sub_accounts_data: dict = {}
+        # 用于重启策略
+        self.MM_stg_data: dict = {
+            'start_time': None,
+            'end_time': None,
+            'running_status': 1,
+            # 初始时主账户现货账户资金
+            'init_main_account_fund': 0,
+            # 策略结束后，主账户现货资金
+            'current_fund': 0,
+        }
+
+    def _set_selection(self):
+        # 设定为只有一个选项，实际上这个选择不影响结果
+        self.stg_selector.addItem('做市策略')
+
+    def _update_btn_status(self) -> None:
+        if not self.api_connected:
+            self.btn_connect_api.setEnabled(True)
+            self.btn_create_stg.setEnabled(False)
+            self.btn_change_param.setEnabled(False)
+            self.btn_initialize.setEnabled(False)
+            self.btn_start_stg.setEnabled(False)
+            self.btn_stop_stg.setEnabled(False)
+        else:
+            self.btn_create_stg.setEnabled(True)
+            if not self.is_stg_created:
+                # 连接api但是没有创建策略
+                self.btn_create_stg.setEnabled(True)
+                self.btn_change_param.setEnabled(False)
+                self.btn_initialize.setEnabled(False)
+                self.btn_start_stg.setEnabled(False)
+                self.btn_stop_stg.setEnabled(False)
+            else:
+                self.btn_create_stg.setEnabled(False)
+                if not self.is_initialized:
+                    self.btn_change_param.setEnabled(True)
+                    self.btn_initialize.setEnabled(True)
+                    self.btn_start_stg.setEnabled(False)
+                    self.btn_stop_stg.setEnabled(False)
+                else:
+                    self.btn_initialize.setEnabled(False)
+                    self.btn_connect_api.setEnabled(False)
+                    self.btn_create_stg.setEnabled(False)
+                    if not self.is_stg_running:
+                        self.btn_start_stg.setEnabled(True)
+                        self.btn_stop_stg.setEnabled(False)
+                    else:
+                        self.btn_start_stg.setEnabled(False)
+                        self.btn_initialize.setEnabled(False)
+                        if not self.is_stg_stopped:
+                            self.btn_stop_stg.setEnabled(True)
+                            self.btn_change_param.setText('查看参数')
+                        else:
+                            self.btn_connect_api.setEnabled(True)
+
+    def _pop_connect_api_dialog(self):
+        self.api_input_dialog = InputApiDialog()
+        self.api_input_dialog.signal_emitter.connect(self._signal_receiver_api_dialog)
+        self.api_input_dialog.exec()
+
+    def _connect_api(self) -> None:
+        """
+        连接交易所的api接口
+        :return:
+        """
+        # self.api_input_dialog.btn_confirm.setEnabled(False)
+        success = True
+        if self.api_input_dialog.use_file():
+            file_name = self.api_input_dialog.get_api_file_name()
+            success = self.main_executor.read_api_params(file_name)
+        else:
+            api_key, api_secret, user_id = self.api_input_dialog.get_api_info()
+            self.main_executor.acquire_api_params(api_key, api_secret, user_id)
+
+        if not success:
+            self.api_input_dialog.response_failure()
+            # self.api_input_dialog.btn_confirm.setEnabled(True)
+            return
+        # todo: 此处有逻辑冗余，是开发时无法检测 gate api参数是否真实正确留下的问题
+        if success:
+            self.api_input_dialog.close()
+            # noinspection PyTypeChecker
+            self.main_executor.initialize(self)
+            self.api_connected = True
+            self._update_btn_status()
+        else:
+            self.api_input_dialog.response_failure()
+            # self.api_input_dialog.btn_confirm.setEnabled(True)
+
+    def _create_stg(self) -> None:
+        self.is_stg_created = False
+        self.main_analyzer, self.param_window = self._return_analyzer_instance()
+        self.param_window.signal_emitter_param.connect(self._signal_receiver_param)
+        # analyzer 首先单向绑定 executor 以获取信息
+        self.main_analyzer.initialize(my_executor=self.main_executor)
+        # self._new_running_col = RunningStgCol(bound_analyzer=new_analyzer_instance, param_window=new_param_window)
+        self.fake_running_col = RunningStgCol(bound_analyzer=self.main_analyzer, param_window=ParamWidget())        # 传入一个空的基类，实际上不会产生信号
+        self._init_detail_browser()
+        self._init_order_browser()
+        self.main_analyzer.bound_column(self.fake_running_col)
+        # self._new_running_col.signal_emitter_col.connect(self._signal_receiver_running_col)
+        self.param_window.show()
+        self._block_window()
+        # del new_analyzer_instance
+        # del new_param_window
+
+    def pre_initialize(self) -> None:
+        """
+        初始化之前的准备工作：
+        创建子账号并写入文件，
+        :return:
+        """
+        stg_token = self.main_executor.add_strategy(self.main_analyzer)
+        self.main_analyzer.acquire_token(stg_token)
+
+        # 添加策略后，创建子账号api并划转资金
+        new_operator = Operator()
+        self.main_analyzer.acquire_operator(new_operator)
+        # todo: work here, 定义子账号之间的链接，临时方法，后续需要修改
+        self.sub_account_num = self.main_analyzer.return_acc_num()
+        self.sub_executor_list = [GateFuturesExecutor() for _ in range(self.sub_account_num)]
+
+        # 检查目录是否存在，不存在则创建
+        if not os.path.exists(self.MM_data_path):
+            os.makedirs(self.MM_data_path)
+        if os.path.exists(os.path.join(self.MM_data_path, self.file_name)):
+            # 读取api并关联
+            with open(os.path.join(self.MM_data_path, self.file_name), 'r', encoding='utf-8') as file:
+                self._sub_accounts_data: dict = json.load(file)
+            # existing_sub_accounts_num = len(self._sub_accounts_data)
+            # additional_add_num = max(0, self.sub_account_num - existing_sub_accounts_num)
+            index = 0
+            for user_id, api_info in self._sub_accounts_data.items():
+                api_info: dict
+                each_executor = self.sub_executor_list[index]
+                if 'name' in api_info and api_info['name'] == self.MM_strategy_api_name:
+                    pass
+                else:
+                    new_key, new_secret = self.create_sub_account_api(user_id)
+                    api_info['name'] = self.MM_strategy_api_name
+                    api_info['api_key'] = new_key
+                    api_info['api_secret'] = new_secret
+
+                each_executor.acquire_api_params(
+                    key=api_info['api_key'],
+                    secret=api_info['api_secret'],
+                    user_id=user_id
+                )
+                index += 1
+                if index == self.sub_account_num:
+                    break
+            while True:
+                if index == self.sub_account_num:
+                    break
+                # 创建一个新账号并创建api和关联
+                raise ValueError('没有写额外创建功能')
+                each_executor = self.sub_executor_list[index]
+                index += 1
+        else:
+            # 创建子账号和api并关联
+            raise ValueError('暂时没有写创建功能')
+            pass
+        # 多账户连接操作完成，写入文件
+        with open(os.path.join(self.MM_data_path, self.file_name), 'w', encoding='utf-8') as file:
+            json.dump(self._sub_accounts_data, file, indent=4)
+
+        # 3.7之后字典是有序数据结构，因此可以如此使用
+        for i in range(len(self.sub_executor_list)):
+            acc_series = str(i + 1).zfill(3)
+            new_account_col = SubAccountCol(acc_series)
+            self._sub_accounts_cols[acc_series] = new_account_col
+        new_operator.initialize(analyzer=self.main_analyzer, executor_list=self.sub_executor_list, account_cols=self._sub_accounts_cols)
+        time.sleep(1)
+        # todo: 如果写等待功能，需要在executor底层返回连接情况，暂不考虑，这里只是简单等待1s
+        self._append_all_account_column()
+
+        self._enable_window()
+        self.is_stg_created = True
+        self._update_btn_status()
+
+    def _append_all_account_column(self) -> None:
+        # for _in, each_executor in enumerate(reversed(self.sub_executor_list)):
+        #     real_index = len(self.sub_executor_list) - 1 - _in
+        #     account_series = str(real_index + 1).zfill(3)        # 反序遍历+1
+        #     append_col = SubAccountCol(account_series)
+        #     self._sub_accounts_cols[account_series] = append_col
+        #     append_col.signal_emitter.connect(self._signal_receiver_account_col)
+        #     self.account_window.column_layout.addWidget(append_col)
+        #     self._add_detail_browser(account_series, append_col.detail_browser)
+        #     self._add_order_browser(account_series, append_col.order_browser)
+        for each_series, each_col in reversed(list(self._sub_accounts_cols.items())):
+            each_col.signal_emitter.connect(self._signal_receiver_account_col)
+            self.account_window.column_layout.addWidget(each_col)
+            self._add_detail_browser(each_series, each_col.detail_browser)
+            self._add_order_browser(each_series, each_col.order_browser)
+
+    def _check_param(self):
+        self.param_window.show()
+        self.ref_info_window.show()
+
+    def _initialize_stg(self) -> None:
+        self.btn_initialize.setEnabled(False)
+        # self.btn_create_stg.setEnabled(False)
+        asyncio.create_task(self._initialize_async())
+        # print('\n熄灭初始化按钮')
+
+    async def _initialize_async(self):
+        # 重新分配资金
+        await asyncio.sleep(0.2)            # 这行代码可以很好的让按钮立即熄灭，原因未知
+        each_fund_demand = round(self.main_analyzer.return_fund_demand() * 1.05 / self.sub_account_num)
+        print(f'\n给每个账户重新分配资金: {each_fund_demand}')
+        user_id_list = [each_executor.return_user_id() for each_executor in self.sub_executor_list]
+        self.aggregate_all_funds(user_id_list)
+        for each_user_id in user_id_list:
+            self.trans_fund_to_sub_account(each_user_id, each_fund_demand)
+        print('转移资金完成!')
+        self.main_analyzer.sub_initialize()
+        asyncio.create_task(self.finish_initialization())
+        # self.is_initialized = True
+        # self._update_btn_status()
+
+    async def finish_initialization(self) -> None:
+        self.is_initialized = True
+        self._update_btn_status()
+
+    def _start_stg(self) -> None:
+        self.main_analyzer.start()
+        self.is_stg_running = True
+        self._update_btn_status()
+
+    def _stop_stg(self) -> None:
+        if self.is_stg_stopped:
+            print('策略已经停止')
+            return
+        self.main_analyzer.stop()
+        time.sleep(0.5)
+        self.is_stg_stopped = True
+        self._update_btn_status()
+
+    def _return_analyzer_instance(self) -> tuple[Analyzer, ParamWidget]:
+        # todo: 如果添加策略，则需要修改
+        # return TestMarketMakerAnalyzer(), MarketMakerGridParam()
+        return SmartGridMarketMakerAnalyzer(), SmartGridMarketMakerParam()
+
+    def _add_detail_browser(self, series: str, browser: DetailBrowser) -> None:
+        """
+        添加右上角信息窗口
+        :param series:
+        :return:
+        """
+        self._detail_browsers[series] = browser
+        self._detail_browser_widget.addWidget(browser)
+
+    def _init_detail_browser(self) -> None:
+        for i in reversed(range(self._detail_browser_widget.count())):
+            widget = self._detail_browser_widget.widget(i)
+            self._detail_browser_widget.removeWidget(widget)
+            widget.deleteLater()
+        self._detail_browsers.clear()
+        self._add_detail_browser('init', self.fake_running_col.detail_browser)
+
+    def _init_order_browser(self) -> None:
+        for i in reversed(range(self._order_browser_widget.count())):
+            widget = self._order_browser_widget.widget(i)
+            self._order_browser_widget.removeWidget(widget)
+            widget.deleteLater()
+        self._order_browsers.clear()
+        self._add_order_browser('init', self.fake_running_col.order_browser)
+
+    def _add_order_browser(self, series: str, browser: OrderBrowser) -> None:
+        """
+        添加右下角订单窗口
+        :param series:
+        :return:
+        """
+        self._order_browsers[series] = browser
+        self._order_browser_widget.addWidget(browser)
+
+    def transfer_status_file(self):
+        # todo 策略结束后，划转资金并将文件重命名
+        pass
+
+    def transfer_column(self, stg_num):
+        # do nothing
+        pass
+
+    def create_sub_account_api(self, user_id) -> tuple[str, str]:
+        # 判断是否有之前使用的做市api，如果有，则返回，如果没有，则创建一个
+        import requests
+        import hashlib
+        import hmac
+
+        host = "https://api.gateio.ws"
+        prefix = "/api/v4"
+        common_headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+        url = f'/sub_accounts/{user_id}/keys'
+        request_content = '{"mode":1,"name":"%s","perms":[{"read_only":false,"name":"spot"},{"read_only":false,"name":"futures"},{"read_only":false,"name":"wallet"}],"ip_whitelist":[]}' % self.MM_strategy_api_name
+
+        key = '5fd7f2c49e94c69d8092ebbb2717c3ab'  # api_key
+        secret = '4747573fc97fe2345410df75b671016dc9003c6bbd8258cf6ea354d28487da0c'  # api_secret
+
+        t = time.time()
+        m = hashlib.sha512()
+        m.update((request_content or "").encode('utf-8'))
+        hashed_payload = m.hexdigest()
+        s = '%s\n%s\n%s\n%s\n%s' % ('POST', prefix + url, "", hashed_payload, t)
+        sign = hmac.new(secret.encode('utf-8'), s.encode('utf-8'), hashlib.sha512).hexdigest()
+
+        sign_headers = {'KEY': key, 'Timestamp': str(t), 'SIGN': sign}
+        sign_headers.update(common_headers)
+
+        response = requests.post(host + prefix + url, headers=sign_headers, data=request_content)
+        if not response.status_code == 200:
+            raise Exception('创建子账号api出错')
+            print(response.text)
+        info_dict = json.loads(response.content)
+
+        return info_dict['key'], info_dict['secret']
+
+    def trans_fund_to_sub_account(self, user_id: int, fund: float):
+        self.main_executor.transfer_fund(
+            user_id=user_id,
+            fund=fund,
+            direction='to'
+        )
+
+    def aggregate_all_funds(self, user_id_list: list[int]):
+        for each_user_id in user_id_list:
+            # todo 查询余额方法需要检查是否清除了挂单和仓位
+            sub_acc_balance = self.main_executor.get_sub_account_futures_balance(each_user_id)
+            truncated_balance = int(sub_acc_balance * 10 ** 8) / 10 ** 8
+            if truncated_balance == 0:
+                return
+            else:
+                self.main_executor.transfer_fund(
+                    user_id=each_user_id,
+                    fund=truncated_balance,
+                    direction='from'
+                )
+
+    def _signal_receiver_api_dialog(self, info: int) -> None:
+        """
+        对dialog信号做出相应
+        :return:
+        """
+        if info == WTOKEN.API_INPUT_CONFIRM:
+            # print('收到窗口确认信号')
+            self._connect_api()
+
+        elif info == WTOKEN.API_INPUT_CLOSE:
+            # print('收到窗口关闭信号')
+            sip.delete(self.api_input_dialog)
+            self.api_input_dialog = None
+        else:
+            print('未定义的window token')
+
+    def _signal_receiver_param(self, info: int) -> None:
+        """
+        对参数输入窗口按钮发送的信号做出相应
+        :param info:
+        :return:
+        """
+        if info == WTOKEN.PARAM_VALIDATION:
+            print('合理参数')
+            check_input_return = self.param_window.check_inputs()
+            if check_input_return['okay']:
+                input_param_dict = self.param_window.get_input_params()
+                # print('\n\n传入参数')
+                # for key, value in input_param_dict.items():
+                #     print(key, ': ', value)
+
+                asyncio.create_task(self._replace_input_params(input_param_dict))
+            else:
+                error_window = WrongParamInputDialog()
+                error_window.set_error_text(check_input_return['msg'])
+                error_window.exec()
+
+        elif info == WTOKEN.PARAM_REF_WINDOW:
+            print('信息参考')
+            check_input_return = self.param_window.check_inputs()
+            if check_input_return['okay']:
+                input_param_dict = self.param_window.get_input_params()
+                asyncio.create_task(self._pop_ref_info_window(input_param_dict))
+            else:
+                error_window = WrongParamInputDialog()
+                error_window.set_error_text(check_input_return['msg'])
+                error_window.exec()
+        elif info == WTOKEN.PARAM_CONFIRM:
+            # print('确认参数')
+            # todo: 有可能合理了参数后就直接confirm，此时ref_info_window没有得到参考信息，如果后续需要参考，则会缺失信息，需要加一步获得参考信息
+            result = self.confirm_box.exec_()
+            if result == QMessageBox.Yes:
+                good_params = self.param_window.get_input_params()
+                self.param_window.set_readonly()
+                self.main_analyzer.confirm_params(good_params)
+                self.param_window.hide()
+                self.pre_initialize()
+            else:
+                pass
+        elif info == WTOKEN.PARAM_WINDOW_CLOSE:
+            self._update_btn_status()
+            self._enable_window()
+            pass
+            # if self.stg_num:
+            #     # 已被添加进策略栏，关闭参数窗口不做操作
+            #     print('关闭 param window, 不操作')
+            # else:
+            #     # 没有获得 stg num，未被添加，直接连带全部删除
+            #     sip.delete(self.param_input_window)
+            #     self.param_input_window = None
+            #     sip.delete(self.ref_info_window)
+            #     self.ref_info_window = None
+            #     self.main_analyzer = None
+            #     self.detail_browser = None
+            #     self.order_browser = None
+            #
+            #     self.signal_emitter_col.emit(WTOKEN.COLUMN_DELETE_REQUEST)
+        else:
+            print('未定义的窗口信号')
+
+    def _signal_receiver_account_col(self, info: str) -> None:
+        emit_series, emit_info = WTOKEN.decode_stg_num(info)
+        if emit_info == WTOKEN.COLUMN_SELECTED:
+            if self._selected_acc_col:
+                self._sub_accounts_cols[self._selected_acc_col].turn_unselected_frame_mode()
+            self._selected_acc_col = emit_series
+            # todo: work here, detail browser
+            self._detail_browser_widget.setCurrentWidget(self._detail_browsers[emit_series])
+            self._order_browser_widget.setCurrentWidget(self._order_browsers[emit_series])
+        elif emit_info == WTOKEN.COLUMN_UNSELECTED:
+            if emit_series == self._selected_acc_col:
+                self._selected_acc_col = None
+            self._detail_browser_widget.setCurrentWidget(self._detail_browsers['init'])
+            self._order_browser_widget.setCurrentWidget(self._order_browsers['init'])
+
+    async def _replace_input_params(self, param_dict: dict) -> dict:
+        """
+        点击合理参数后，将经 Analyzer 分析并替换的参数显示在 param window
+        :param param_dict:
+        :return:
+        """
+        new_param_dict = await self.main_analyzer.validate_param(param_dict)
+        self.param_window.update_text(new_param_dict)
+        # 只有analyzer判断参数合理，才能开启确认按钮
+        if new_param_dict['valid']:
+            self.param_window.btn_confirm_param.setEnabled(True)
+        return new_param_dict
+
+    async def _pop_ref_info_window(self, param_dict: dict) -> None:
+        """
+        弹出参考信息窗口，此前也需要合理参数
+        :param param_dict:
+        :return:
+        """
+        new_param_dict = await self._replace_input_params(param_dict)
+        # 如果analyzer判断参数不合理，则不会弹出信息窗口
+        if new_param_dict['valid']:
+            ref_info = await self.main_analyzer.param_ref_info(new_param_dict)
+            self.ref_info_window.set_ref_info(ref_info)
+            self.ref_info_window.show()
+            if not self.param_window_moved:
+                self.param_window.move(560, 160)
+                self.param_window_moved = True
 
 
 class FinalWindow(QWidget):
@@ -900,7 +1497,7 @@ class FinalWindow(QWidget):
         main_container.setContentsMargins(2, 0, 2, 2)
 
         temp_font = QFont()
-        temp_font.setFamily('Aria')
+        temp_font.setFamily('Arial')
         temp_font.setPixelSize(12)
 
         self.page_tab = QTabWidget()
@@ -943,17 +1540,21 @@ class FinalWindow(QWidget):
         新增一交易界面
         :return:
         """
-        new_executor_ins, need_recover = self._creating_ui_dialog.return_executor_instance()
+        new_executor_ins, func_num = self._creating_ui_dialog.return_executor_instance()
         if new_executor_ins:
             print(new_executor_ins.NAME)
             new_executor_ins.set_stg_series(self.ui_series_num)
             self.ui_series_num += 1
 
             # 在此处定义一个新 UI 界面实例, 创建时就完成了executor的初始化工作
-            if need_recover:
-                new_ui_win = TradingRecoverUI(new_executor_ins)
-            else:
+            if func_num == 0:
                 new_ui_win = TradingUI(new_executor_ins)
+            elif func_num == 1:
+                new_ui_win = TradingRecoverUI(new_executor_ins)
+            elif func_num == 2:
+                new_ui_win = TradingMarketMakerUI(new_executor_ins)
+            else:
+                new_ui_win = None
 
             new_tab = QFrame()
             new_tab_layout = QHBoxLayout()

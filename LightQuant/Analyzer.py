@@ -80,18 +80,11 @@ class Analyzer:
 
     def _log_info(self, update_line: str, *args: str) -> None:
         self._bound_running_column.update_trade_orders(update_line)
-        # todo: solve such problem
-        if self._my_logger:
-            self._my_logger.log_print(update_line)
-        else:
-            print(update_line)
+        self._my_logger.log_print(update_line)
 
         for each_content in args:
             self._bound_running_column.update_trade_orders(each_content)
-            if self._my_logger:
-                self._my_logger.log_print(update_line)
-            else:
-                print(update_line)
+            self._my_logger.log_print(update_line)
 
     async def restart(self, stg_info: dict, save_file_name: str) -> bool:
         pass

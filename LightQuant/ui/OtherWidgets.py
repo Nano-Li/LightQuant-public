@@ -133,7 +133,7 @@ class InputApiDialog(QDialog):
         self.input_file_name = QLineEdit(down_frame)
         self.input_file_name.setFont(temp_font)
         self.input_file_name.setGeometry(110, 18, 180, 24)
-        self.input_file_name.setText('gate_api.txt')
+        self.input_file_name.setText('gate_api_main.txt')
         self.input_file_name.setEnabled(False)
 
         self.btn_confirm = QPushButton('确定', self)

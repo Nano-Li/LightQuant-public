@@ -1,43 +1,28 @@
 # -*- coding: utf-8 -*-
-# @Time : 2023/12/6 11:17
+# @Time : 2024/2/10 19:59
 # @Author : 
-# @File : SmartGridFutures.py 
+# @File : SmartGridMMFutures.py 
 # @Software: PyCharm
 import time
 import asyncio
 import numpy as np
 import pandas as pd
 from decimal import Decimal
-from LightQuant.Preserver import Preserver
 from LightQuant.Recorder import LogRecorder
 from LightQuant.tools.calc import calc, calc_sum
 from LightQuant.tools.round_step_size import round_step_size
 from LightQuant.Analyzer import Analyzer
 from LightQuant.Executor import Executor
+from LightQuant.strategy.GateMarketMaker.Operator import Operator
 from LightQuant.protocols.BinanceToken import BinanceToken as Token
 
 
-class SmartGridAnalyzerFutures(Analyzer):
+class SmartGridMarketMakerAnalyzer(Analyzer):
     """
-    适用于所有合约的智能调仓，采用等比网格，该策略可以成为终极智能调仓的先导版
-    包含基本功能：
-        1.可选挂单触发
-        2.poc高频挂单，支持高频策略
-        3.定时检查并维护仓位和挂单
-        4.仓位矫正功能
-        5.智能处理累计部分成交挂单
-        6.价格偏离预警
-    添加额外功能：
-        1.等比网格策略，长期更合理
-        2.设置每阶补仓，买入金额相同，补仓价格同样按照百分比
-        3.影藏的自动填充参数功能
-    特殊：
-        1.非均匀网格数量的实现：使用列表存储所有网格数量，由于max index 不会挂买单
-          卖单使用c index，而买单使用c index+1，如此和初始买入一定数量，达到补仓位全部卖出的逻辑对应
-          如此使用一个列表可以同时存储买卖网格数量。未实现盈亏和策略正确仓位也需要重新考量
+    做市策略
     """
 
-    STG_NAME = '智能调仓网格'
+    STG_NAME = '高频做市智能网格'
 
     BUY: str = 'BUY'
     SELL: str = 'SELL'
@@ -52,10 +37,13 @@ class SmartGridAnalyzerFutures(Analyzer):
         'trigger_start': None,  # 是否用挂单触发, True/False
         'pending_trigger_price': None,
 
-        'grid_rel_step': None,
+        'grid_price_step': None,
         'filling_step': None,
         'lower_step': None,
-        'filling_fund': None  # 设定补仓资金，按照现货计算
+        'filling_fund': None,  # 设定补仓资金，按照现货计算
+
+        'short_ratio': None,  # 初始空单比例
+        'account_num': None,  # 子账号数量
     }
 
     def __init__(self) -> None:
@@ -71,20 +59,25 @@ class SmartGridAnalyzerFutures(Analyzer):
         self.trigger_start: bool = False
         self.trigger_price = None
 
-        self.grid_step_ratio = None  # 等比网格比例，单位为1
+        self.grid_price_step = None  # 等差网格间距
         self.filling_step_ratio = None  # 等比填仓比例，单位为1
         self.lower_space_ratio = None  # 下方空间比例
         self.filling_fund = None  # 每次填仓资金
+
+        self._account_num = None
+        self.short_ratio = None  # 一部分多单不买入，相当于做空的比例
 
         # 输入相关，仅作为临时存储
         self._x_grid_up_limit = None
         self._x_leverage = None
         self._x_trigger_start = False
         self._x_trigger_price = None
-        self._x_price_rel_step = None
+        self._x_price_abs_step = None
         self._x_filling_step = None
         self._x_lower_step = None
         self._x_filling_fund = None
+
+        self._x_short_ratio = None
 
         # ==================== 合约交易规则变量 ==================== #
         self.symbol_price_min_step = None
@@ -104,12 +97,16 @@ class SmartGridAnalyzerFutures(Analyzer):
         self.critical_index: int = 0
         # 所有网格的价格，由index索引，考虑到无限网格可能会很大，该元祖会随着网格抬升自动添加，每个价格不包括base index
         self.all_grid_price: tuple = ()
-        # 所有网格的数量，于gate而言，指的是合约张数，tuple(int)，与楼上有相似的维护机制，由于买卖单机制，该tuple的0 index没有作用
+        # 所有网格的数量，于gate而言，指的是合约张数，tuple(int)，与楼上有相似的维护机制，
         self.all_grid_quantity: tuple = ()
+        # 当前网格数量(动态减少), 统计用
+        self.each_grid_quantity: int = 0
         # 需要补仓的价格index， 当 critical_index 属于其中时，执行补仓操作，补仓后，删除index以实现到达位置只补仓一次的功能，该列表随着策略运行会增加index
         self.indices_of_filling: list = []
         # 所有filling_price下方的网格价格，不包括base index，长度最终和楼上一样
-        self.all_lower_prices: list[tuple] = []
+        # self.all_lower_prices: list[tuple] = []
+        # 对冲需求：0仓位index
+        self.zero_pos_index = 0
         # 当前处在第几级台阶，即已经补了多少次仓位
         self.present_stair_num = 0
         # 当前需要补仓的index
@@ -122,9 +119,9 @@ class SmartGridAnalyzerFutures(Analyzer):
         # 当前基准index
         self.present_base_index = 0
         # 自动补单的网格数量间隔，不包括base index，但是这个计算是理论上的，实际有可能因为间距过密，数量更少，因此每次都要重新计算
-        self.filling_grid_step_num = 0
+        # self.filling_grid_step_num = 0
         # 下方网格数量，包括基准入场网格
-        self.lower_grid_step_num = 0  # 两者相加就是做多网格的 网格总数-1
+        # self.lower_grid_step_num = 0  # 两者相加就是做多网格的 网格总数-1
         # 当前保存了几个网格的参数
         self.saved_stair_num = 0
 
@@ -134,7 +131,7 @@ class SmartGridAnalyzerFutures(Analyzer):
         self.max_index = 0
         # 所有做多网格的基准入场价格，不包括策略入场价，在一开始就计算清楚
         self.all_filling_prices: list[float] = []
-        # 所有补仓数量，适应gate张数
+        # 所有补仓数量，适应gate张数，根据网格数量微调，随台阶上涨
         self.all_filling_quantities: list[int] = []
         # 从入场网格到最上方价格的所有网格数量，包括入场的 entry index，用处不大
         self.up_grid_num = 0
@@ -145,7 +142,7 @@ class SmartGridAnalyzerFutures(Analyzer):
         # 入场时对标网格的价格
         self.entry_grid_price = 0
         self.entry_index = 0
-        # 初始买入数量, gate合约张数
+        # 初始市价买入数量, gate合约张数
         self.entry_grid_qty = 0
 
         # 设置买卖单最大挂单数量，及最小数量
@@ -213,17 +210,6 @@ class SmartGridAnalyzerFutures(Analyzer):
         }
 
         # ==================== 特殊功能相关变量 ==================== #
-        # 部分成交订单处理  {'id': int}   order_id, left_quantity   注意买卖挂单数量均用绝对值储存
-        self.partially_filled_orders: dict[str, int] = {}
-        # 按大小顺序？存储部分成交订单index list, 用于判断距离并定时处理
-        self.partially_orders_indices_list: list[int] = []
-
-        # 策略需要马上修正挂单，该变量也充当类似开关功能
-        self._need_fix_order: bool = False
-        # noinspection PyTypeChecker
-        self._fix_order_task: asyncio.Task = None
-        # 设置一个锁，该锁为True时，策略正在调整挂单，此时不允许检查挂单
-        self._cannot_check_open_orders: bool = False
 
         # 入场触发挂单剩余数量
         self._ENTRY_ORDER_qty_left: int = 0
@@ -235,19 +221,6 @@ class SmartGridAnalyzerFutures(Analyzer):
         # 前一个最新ticker价格
         self.previous_price = 0
 
-        # ============ 策略调仓功能 ============ # 修正仓位订单id，-1代表当前没有需要修正的挂单
-        self.adjusting_index: int = -1
-        # 由此衍生的变量
-        self._adjusting_order_side: str = self.BUY
-        self._adjusting_qty_left: int = 0
-        self._adjusting_qty_target: int = 0
-
-        # 处理修改订单数量失败时，需要使用的变量，存储修改特殊订单位置时，前一个特殊订单的id，归零时一起归零
-        self._pre_adjusting_index: int = -1
-
-        # 充当开关作用，表示需要特殊挂单以修正仓位
-        self._need_adjust_pos: bool = False
-
         # 定时器，反复重置以达到核心功能
         # noinspection PyTypeChecker
         self._ticker_delay_timer: asyncio.TimerHandle = None
@@ -256,17 +229,11 @@ class SmartGridAnalyzerFutures(Analyzer):
         # 协程锁，防止重复开启协程任务
         self._doing_delay_task: bool = False
 
-        # 程序会记录所有的仓位偏移，目前已知的仓位偏移来源：    1.poc订单驳回   2.永久偏离的部分成交
-        # 累计待处理的仓位偏移，大于0表示立即买入该数量后，仓位回归正常，反之则表示需要立即卖出       # 该变量记录了驳回导致的仓位偏移
-        self._accumulated_pos_deviation: int = 0
-        # 当修改订单出现错误时，变量退回到这个偏移，用于防止修改特殊订单失败后丢失仓位偏移信息
-        self._pre_save_acc_pos_dev: int = 0
-
         # ==================== 其他变量 ==================== #
         # noinspection PyTypeChecker
         self._my_logger: LogRecorder = None
 
-        self._is_trading = False  # todo: 修改至基类
+        self._is_trading = False
 
         # 是否在等待挂单
         self._is_waiting = False
@@ -278,10 +245,29 @@ class SmartGridAnalyzerFutures(Analyzer):
         # 保存最后的参考信息
         self._save_ref_info_text: str = ''
 
+        # # 使用多少个子账号进行交易
+        # self._account_num: int = 0
+        # noinspection PyTypeChecker
+        self._my_operator: Operator = None
+
     def initialize(self, my_executor: Executor) -> None:
-        # 绑定 executor
+        # 绑定 executor, 注意这里的executor是连接主账户的executor，仅用于获得参考信息
         super().initialize(my_executor)
         return
+
+    def return_acc_num(self) -> int:
+        return self._account_num
+
+    def return_fund_demand(self) -> float:
+        return 100
+
+    def acquire_operator(self, operator: Operator) -> None:
+        self._my_operator = operator
+
+    def sub_initialize(self):
+        self._my_operator.start_all_subscription()
+        self._my_operator.change_leverage(self.symbol_leverage)
+        time.sleep(0.5)
 
     # starting methods
     async def _get_trading_rule(self, symbol_name: str) -> bool:
@@ -319,10 +305,12 @@ class SmartGridAnalyzerFutures(Analyzer):
         self._x_leverage = validated_params['leverage']
         self._x_trigger_start = validated_params['trigger_start']
         self._x_trigger_price = validated_params['pending_trigger_price']
-        self._x_price_rel_step = validated_params['grid_rel_step']
+        self._x_price_abs_step = validated_params['grid_abs_step']
         self._x_filling_step = validated_params['filling_step']
         self._x_lower_step = validated_params['lower_step']
         self._x_filling_fund = validated_params['filling_fund']
+        self._account_num = int(validated_params['account_num'])
+        self._x_short_ratio = validated_params['short_ratio']
 
         symbol_exist = await self._get_trading_rule(validated_params['symbol_name'])
 
@@ -330,7 +318,9 @@ class SmartGridAnalyzerFutures(Analyzer):
             self.current_symbol_price = await self._my_executor.get_current_price(validated_params['symbol_name'])
 
             # 判断杠杆数是否合理
-            if self._x_leverage > self.symbol_max_leverage:
+            if self._x_leverage == '':
+                self._x_leverage = 20
+            if self._x_leverage > self.symbol_max_leverage or self._x_leverage < 1:
                 self._x_leverage = str(self._x_leverage) + '杠杆数值超限'
                 param_valid = False
 
@@ -369,26 +359,26 @@ class SmartGridAnalyzerFutures(Analyzer):
 
             # 套利部分，首先设定默认值
             if param_valid:
-                if self._x_price_rel_step == '':
-                    self._x_price_rel_step = 0.5
+                if self._x_price_abs_step == '':
+                    self._x_price_abs_step = 1
                 if self._x_filling_step == '':
-                    self._x_filling_step = 20
+                    self._x_filling_step = 2
                 if self._x_lower_step == '':
-                    self._x_lower_step = 30
+                    self._x_lower_step = 5
 
                 # 设定数字精度，降低计算难度
-                self._x_price_rel_step = round_step_size(self._x_price_rel_step, 0.0001)  # 百万分之一
+                self._x_price_abs_step = round_step_size(self._x_price_abs_step, self.symbol_price_min_step)
                 self._x_filling_step = round(self._x_filling_step, 2)
                 self._x_lower_step = round(self._x_lower_step, 2)
-                # 如果输入0，则使用最小精度
-                self._x_price_rel_step = max(self._x_price_rel_step, round_step_size(self.symbol_price_min_step / entry_price, 0.0001))
                 # 计算上下方网格数量
-                up_grid_num = int(np.floor(np.log(1 + self._x_filling_step / 100) / np.log(1 + self._x_price_rel_step / 100)))  # 不计算base网格，算上顶部价格的网格，由于实际网格是用顶部网格代替最高价格，所以数量不变
-                low_grid_num = int(np.floor(np.log(1 - self._x_lower_step / 100) / np.log(1 - self._x_price_rel_step / 100)))
+                # up_grid_num = int(np.floor(np.log(1 + self._x_filling_step / 100) / np.log(1 + self._x_price_abs_step / 100)))  # 不计算base网格，算上顶部价格的网格，由于实际网格是用顶部网格代替最高价格，所以数量不变
+                # low_grid_num = int(np.floor(np.log(1 - self._x_lower_step / 100) / np.log(1 - self._x_price_abs_step / 100)))
+                up_grid_num = int(self._x_filling_step * entry_price / self._x_price_abs_step)
+                low_grid_num = int(self._x_lower_step * entry_price / self._x_price_abs_step)
                 # print('上方网格数量:{}\t下方网格数量:{}'.format(up_grid_num, low_grid_num))
 
                 # 补仓次数需要大于1
-                if self._x_grid_up_limit <= round_step_size(calc(entry_price, calc(1, calc(calc(self._x_filling_step, calc(self._x_price_rel_step, 2, '*'), '+'), 100, '/'), '+'),
+                if self._x_grid_up_limit <= round_step_size(calc(entry_price, calc(1, calc(calc(self._x_filling_step, calc(self._x_price_abs_step, 2, '*'), '+'), 100, '/'), '+'),
                                                                  '*'), self.symbol_price_min_step):  # 补仓点位 + 2 * 网格比例间距，上界价格大于该价格
                     self._x_grid_up_limit = str(self._x_grid_up_limit) + '补仓次数小于1'
                     param_valid = False
@@ -409,10 +399,22 @@ class SmartGridAnalyzerFutures(Analyzer):
                 if param_valid:
                     filling_times = int(np.floor(np.log(self._x_grid_up_limit / entry_price) / np.log(1 + self._x_filling_step / 100)))
                     max_filling_price = self.round_step_precision(entry_price * (1 + self._x_filling_step / 100) ** filling_times, self.symbol_price_min_step)
-                    min_fund_demand = calc(max_filling_price, calc(up_grid_num, self.symbol_quantity_min_step, '*'), '*')
+                    max_up_grid_num = int(max_filling_price * (self._x_filling_step / 100) / self._x_price_abs_step)
+                    min_fund_demand = calc(max_filling_price, calc(max_up_grid_num, self.symbol_quantity_min_step, '*'), '*')
                     # print('最低金额需求: {} USDT'.format(min_fund_demand))
-                    # 最低资金加一美刀，保险
+                    # 最低资金加1美刀，保险
                     self._x_filling_fund = max(self._x_filling_fund, min_fund_demand + 1)
+
+                    self._x_short_ratio = round(self._x_short_ratio, 2)
+                    if not 0 <= self._x_short_ratio <= 0.5:
+                        self._x_short_ratio = str(self._x_short_ratio) + '做空比例不合理'  # 否则最后一阶，初始没有做多，全是做空
+                        param_valid = False
+
+            # 多账号部分
+            if param_valid:
+                if self._account_num <= 0:
+                    self._account_num = str(self._account_num) + '账户数量错误'
+                    param_valid = False
 
         else:
             validated_params['symbol_name'] += '未查询到该合约'
@@ -422,10 +424,12 @@ class SmartGridAnalyzerFutures(Analyzer):
         validated_params['leverage'] = self._x_leverage
         validated_params['trigger_start'] = self._x_trigger_start
         validated_params['pending_trigger_price'] = self._x_trigger_price
-        validated_params['grid_rel_step'] = self._x_price_rel_step
+        validated_params['grid_abs_step'] = self._x_price_abs_step
         validated_params['filling_step'] = self._x_filling_step
         validated_params['lower_step'] = self._x_lower_step
         validated_params['filling_fund'] = self._x_filling_fund
+        validated_params['account_num'] = self._account_num
+        validated_params['short_ratio'] = self._x_short_ratio
         validated_params['valid'] = param_valid
 
         return validated_params
@@ -446,15 +450,10 @@ class SmartGridAnalyzerFutures(Analyzer):
             info_texts += '\n\t\t\t\t触发价格: {}\n'.format(str(self.trigger_price))
 
         # 计算一些参考数据，套利利润
-        present_grid_step = calc(self.all_grid_price[self.entry_index + 1], self.all_grid_price[self.entry_index], '-')
-        present_grid_precision_multi = int(calc(present_grid_step, self.symbol_price_min_step, '/'))  # 当前网格间距精度倍数
-        each_grid_profit_low = calc(calc(self.all_grid_price[self.entry_index + 1], self.all_grid_price[self.entry_index], '-'),
-                                    calc(self.all_grid_quantity[self.entry_index + 1], self.symbol_quantity_min_step, '*'), '*')
-        each_grid_profit_high = calc(calc(self.all_grid_price[self.present_step_up_index], self.all_grid_price[self.present_step_up_index - 1], '-'),
-                                     calc(self.all_grid_quantity[self.present_step_up_index], self.symbol_quantity_min_step, '*'), '*')
+        each_grid_profit = calc(self.grid_price_step, calc(self.all_grid_quantity[self.entry_index], self.symbol_quantity_min_step, '*'), '*')
         filling_margin_occupation = calc(calc(calc(self.entry_grid_qty, self.symbol_quantity_min_step, '*'), self.entry_grid_price, '*'), self.symbol_leverage, '/')
         # 经过计算，由于策略的等比性质，不同台阶位置的套利区间底部保证金占用和策略亏损(相同回撤比例)基本相同
-        max_margin_cost = calc(calc(calc(sum(self.all_grid_quantity[self.present_bottom_index + 1:self.present_step_up_index + 1]),
+        max_margin_cost = calc(calc(calc(sum(self.all_grid_quantity[self.present_bottom_index + 1:self.zero_pos_index + 1]),
                                          self.symbol_quantity_min_step, '*'), self.present_bottom_price, '*'), self.symbol_leverage, '/')
         # 给出参考亏损，即台阶底部亏损
         max_loss_ref = self.unmatched_profit_calc(
@@ -467,12 +466,18 @@ class SmartGridAnalyzerFutures(Analyzer):
             current_price=self.all_grid_price[0]
         )
         # 维持策略所需账户资金
-        self.account_fund_demand = calc(max_margin_cost, abs(max_loss_ref), '+')
+        self._reasonable_order_num_estimate()
+        # init_buy_order_num, init_sell_order_num = int((self.max_buy_order_num + self.min_buy_order_num) / 2), int((self.max_sell_order_num + self.min_sell_order_num) / 2)
+        order_margin = calc(calc(calc(calc_sum(self.all_grid_price[self.entry_index - self.max_buy_order_num:self.entry_index]),
+                                      calc_sum(self.all_grid_quantity[self.entry_index + 1:self.entry_index + self.max_sell_order_num + 1]), '+'),
+                                 calc(self.all_grid_quantity[self.entry_index], self.symbol_quantity_min_step, '*'), '*'), self.symbol_leverage, '/')
+        self.account_fund_demand = calc(calc(max_margin_cost, abs(max_loss_ref), '+'), order_margin, '+')
         # 列出回调不同比例时的策略亏损
-        list_callback_ratio = [0.05, 0.1, 0.2, 0.3, 0.5]
+        list_callback_ratio = [0.01, 0.02, 0.05, 0.08, 0.1]
         list_critical_indices = [0] * len(list_callback_ratio)
         list_prices = [round_step_size(calc(self.entry_grid_price, 1 - each_ratio, '*'), self.symbol_price_min_step) for each_ratio in list_callback_ratio]
         list_callback_losses = [0.] * len(list_callback_ratio)
+        list_fund_demand = [0.] * len(list_callback_ratio)
         for p_index, _ in enumerate(self.all_grid_price):
             for _index, _price in enumerate(list_prices):
                 if self.all_grid_price[p_index] <= _price < self.all_grid_price[p_index + 1]:
@@ -488,26 +493,35 @@ class SmartGridAnalyzerFutures(Analyzer):
                 init_pos_qty=self.entry_grid_qty,
                 current_price=list_prices[index]
             )
-
+            each_margin_cost = calc(calc(calc(sum(self.all_grid_quantity[list_critical_indices[index] + 1:self.zero_pos_index + 1]),
+                                         self.symbol_quantity_min_step, '*'), list_prices[index], '*'), self.symbol_leverage, '/')
+            list_fund_demand[index] = calc(calc(each_margin_cost, abs(list_callback_losses[index]), '+'), order_margin, '+')
+        print('done calculation')
         info_texts += '\n网格总数量\t\t{:<8}\n'.format(str(self.grid_total_num))
-        info_texts += '套利区间网格数量\t\t{} + {}\n'.format(str(self.filling_grid_step_num), str(self.lower_grid_step_num))
-        info_texts += '当前网格间距\t\t{:<8}\t\t（ {} 倍精度 ）\n'.format(np.format_float_positional(present_grid_step, trim='-'), str(present_grid_precision_multi))
+        info_texts += '套利区间网格数量\t\t{} + {}\n'.format(str(self.present_base_index), str(self.present_step_up_index - self.present_base_index + 1))
+        info_texts += '等差网格间距\t\t{:<8}\n'.format(self.grid_price_step)
         info_texts += '全程补仓次数\t\t{:<8}\t\t次\n'.format(str(self.stairs_total_num))
 
-        info_texts += '\n每格套利利润\t\t{} ~ {}\t{:<8}\n'.format(each_grid_profit_low, each_grid_profit_high, symbol_name[-4:])
-        info_texts += '每阶做多收益\t\t{:<8}\t\t{:<8}\n'.format(str(self._each_stair_profit[0]), symbol_name[-4:])
-        info_texts += '全程做多收益\t\t{:<8}\t\t{:<8}\n'.format(str(calc(self._each_stair_profit[0], self.stairs_total_num, '*')), symbol_name[-4:])
+        info_texts += '\n每格套利利润\t\t{}\t\t{:<8}\n'.format(each_grid_profit, symbol_name[-4:])
+        info_texts += '每阶做多收益\t\t{:<8}\t\t{:<8}\n'.format(round(self._each_stair_profit[0], 3), symbol_name[-4:])
+        info_texts += '全程做多收益\t\t{:<8}\t\t{:<8}\n'.format(round(calc_sum(self._each_stair_profit), 3), symbol_name[-4:])
+
+        info_texts += '\n使用子账号数量\t\t{}\t个\n'.format(self._account_num)
+        info_texts += '挂单价格范围:\t\t下方  {}\t上方  {}\n'.format(calc(self.grid_price_step, self.max_buy_order_num, '*'), calc(self.grid_price_step, self.max_sell_order_num, '*'))
 
         info_texts += '\n补仓占用保证金\t\t{:<8}\t\t{:<8}\n'.format(str(round(filling_margin_occupation, 2)), symbol_name[-4:])
-        info_texts += '最大持仓保证金\t\t{:<8}\t\t{:<8}\n'.format(str(round(max_margin_cost, 2)), symbol_name[-4:])
+        info_texts += '挂单占用保证金\t\t{:<8}\t\t{:<8}\n'.format(str(round(order_margin, 2)), symbol_name[-4:])
+        info_texts += '最大仓位保证金\t\t{:<8}\t\t{:<8}\n'.format(str(round(max_margin_cost, 2)), symbol_name[-4:])
 
         info_texts += '\n策略资金需求\t\t{:<8}\t\t{:<8}\t（账户最低资金）\n'.format(str(round(self.account_fund_demand, 2)), symbol_name[-4:])
 
         info_texts += '\n\n区间底部亏损\t\t{:<8}\t\t{:<8}\n'.format(str(round(max_loss_ref, 2)), symbol_name[-4:])
 
-        info_texts += '\n补仓位价格回调\t\t策略亏损'
-        for index, each_fund_callback in enumerate(list_callback_losses):
-            info_texts += '\n{:>8} %\t\t{:>8}\t{}'.format(str(100 * list_callback_ratio[index]), str(round(each_fund_callback, 2)), symbol_name[-4:])
+        info_texts += '\n补仓位价格回调\t\t策略亏损\t\t账户资金需求'
+        # for index, each_fund_callback in enumerate(list_callback_losses):
+        for each_ratio, each_fund_callback, each_fund_demand in zip(list_callback_ratio, list_callback_losses, list_fund_demand):
+            info_texts += '\n{:>8} %\t\t{:>8}\t\t{:>8}\t{}'.format(str(100 * each_ratio), str(round(each_fund_callback, 2)),
+                                                                   str(round(each_fund_demand, 2)), symbol_name[-4:])
 
         info_texts += '\n\n*** {} ***'.format('=' * 32)
 
@@ -518,14 +532,7 @@ class SmartGridAnalyzerFutures(Analyzer):
     def confirm_params(self, input_params: dict) -> None:
         self.symbol_name = input_params['symbol_name']
 
-        self._my_executor.start_single_contract_order_subscription(self.symbol_name)
-        self._my_executor.start_single_contract_ticker_subscription(self.symbol_name)
-
     def return_params(self) -> dict:
-        """
-        返回策略参数，此时策略参数是正确的，恢复策略用
-        :return:
-        """
         stg_params = self.param_dict.copy()
 
         stg_params['symbol_name'] = self.symbol_name
@@ -533,10 +540,12 @@ class SmartGridAnalyzerFutures(Analyzer):
         stg_params['leverage'] = self._x_leverage
         stg_params['trigger_start'] = self._x_trigger_start
         stg_params['pending_trigger_price'] = self._x_trigger_price
-        stg_params['grid_rel_step'] = self._x_price_rel_step
+        stg_params['grid_abs_step'] = self._x_price_abs_step
         stg_params['filling_step'] = self._x_filling_step
         stg_params['lower_step'] = self._x_lower_step
         stg_params['filling_fund'] = self._x_filling_fund
+        stg_params['account_num'] = self._account_num
+        stg_params['short_ratio'] = self._x_short_ratio
         stg_params['valid'] = True
 
         return stg_params
@@ -544,7 +553,7 @@ class SmartGridAnalyzerFutures(Analyzer):
     def derive_functional_variables(self, assign_entry_price: float = 0) -> None:
         """
         计算策略运行需要的相关变量
-        策略实现方法：每达到补仓点位，相当于重新开启了一个等比做多网格
+        策略实现方法：每达到补仓点位，相当于重新开启了一个等差做多网格
         因此首先计算所有补仓价格，然后以该补仓价格为基准计算等比网格价格
         网格间距变化方法：首先保存上方大量范围的网格价格，并另外存储每个台阶下方的网格价格
         当台阶上升时，使用类似非线性网格的逻辑更新所有网格价格，保持index不变，下方多余位置，以0填充
@@ -556,10 +565,12 @@ class SmartGridAnalyzerFutures(Analyzer):
         self.trigger_start = self._x_trigger_start
         self.trigger_price = self._x_trigger_price
 
-        self.grid_step_ratio = calc(self._x_price_rel_step, 100, '/')
+        self.grid_price_step = self._x_price_abs_step
         self.filling_step_ratio = calc(self._x_filling_step, 100, '/')
         self.lower_space_ratio = calc(self._x_lower_step, 100, '/')
         self.filling_fund = self._x_filling_fund
+
+        self.short_ratio = self._x_short_ratio
 
         # 根据当前价格，给出 entry price，最新价格在参考信息和 策略开始运行两处都会使用，如果挂单触发，则为触发价格
         if self.trigger_start:
@@ -579,31 +590,33 @@ class SmartGridAnalyzerFutures(Analyzer):
         # 如果最后一个补仓价格完全等于上边界价格，则剔除该价格
         if self.all_filling_prices[-1] == self.up_limit_price:
             self.all_filling_prices.pop(-1)
-        # self.all_filling_quantities = [int(calc(self.filling_fund, calc(each_fill_price, self.symbol_quantity_min_step, '*'), '/'))
-        #                                for each_fill_price in self.all_filling_prices]
         # print('prices of filling: {}'.format(self.all_filling_prices))
         self.stairs_total_num = len(self.all_filling_prices)
         # 再计算一阶网格价格
-        up_grid_price = self.isometric_grid_calc(self.entry_grid_price, self.grid_step_ratio, self.all_filling_prices[0])
-        down_grid_price = self.isometric_grid_calc(self.entry_grid_price, self.grid_step_ratio,
-                                                   self.round_step_precision(self.entry_grid_price * (1 - self.lower_space_ratio), self.symbol_price_min_step))[:-1]
+        # up_grid_price = self.isometric_grid_calc(self.entry_grid_price, self.grid_step_ratio, self.all_filling_prices[0])
+        # down_grid_price = self.isometric_grid_calc(self.entry_grid_price, self.grid_step_ratio,
+        #                                            self.round_step_precision(self.entry_grid_price * (1 - self.lower_space_ratio), self.symbol_price_min_step))[:-1]
+        up_grid_price = self.arithmetic_grid_calc(self.entry_grid_price, self.grid_price_step, self.all_filling_prices[0])
+        down_grid_price = self.arithmetic_grid_calc(self.entry_grid_price, self.grid_price_step,
+                                                    self.round_step_precision(self.entry_grid_price * (1 - self.lower_space_ratio), self.symbol_price_min_step))[:-1]
         up_grid_price[-1] = self.all_filling_prices[0]
-        self.filling_grid_step_num = len(up_grid_price) - 1  # 减去base index
-        self.lower_grid_step_num = len(down_grid_price)
+        # self.filling_grid_step_num = len(up_grid_price) - 1  # 减去base index
+        # self.lower_grid_step_num = len(down_grid_price)
 
         self.all_grid_price = tuple(down_grid_price + up_grid_price)
         # print('初始做多网格:\n{}'.format(self.all_grid_price))
 
         # 计算网格总数
-        last_stair_grid_num = int(np.floor(np.log(self._x_grid_up_limit / self.all_filling_prices[-1]) / np.log(1 + self.grid_step_ratio)))  # 不包括base index，也不包括上界价格
-        self.grid_total_num = last_stair_grid_num + self.stairs_total_num * self.filling_grid_step_num + self.lower_grid_step_num + 1
+        # last_stair_grid_num = int(np.floor(np.log(self._x_grid_up_limit / self.all_filling_prices[-1]) / np.log(1 + self.grid_step_ratio)))  # 不包括base index，也不包括上界价格
+        self.up_grid_num = int(calc(calc(self._x_grid_up_limit, self.entry_grid_price, '-'), self.grid_price_step, '/')) + 1
+        self.grid_total_num = self.up_grid_num + len(down_grid_price)
         self.max_index = self.grid_total_num - 1
 
         # 更新相关index
         self.present_stair_num = 0
         self.present_bottom_index = 0
-        self.present_base_index = self.lower_grid_step_num
-        self.present_step_up_index = self.present_base_index + self.filling_grid_step_num
+        self.present_base_index = len(down_grid_price)
+        self.present_step_up_index = len(self.all_grid_price) - 1
         self.indices_of_filling = [self.present_step_up_index, ]
         # 更新其他动态变量
         self.present_bottom_price = self.all_grid_price[self.present_bottom_index]
@@ -611,24 +624,31 @@ class SmartGridAnalyzerFutures(Analyzer):
 
         self.entry_index = self.present_base_index
         self.critical_index = self.entry_index
+        self.zero_pos_index = self.present_base_index + int((self.present_step_up_index - self.present_base_index) * (1 - self.short_ratio))
 
-        # 这里添加一项保险，filling fund使用实时的最小值去更新，如果确认参数后，价格上涨较快，到用户点击开始运行时最小资金需求又提高了，则会触发该代码
-        real_time_min_fund = calc(self.all_filling_prices[-1], calc(self.filling_grid_step_num, self.symbol_quantity_min_step, '*'), '*')
-        # todo: 此处不能_log_info,可以考虑写一个弹窗，全局提醒用
-        self.filling_fund = max(self.filling_fund, real_time_min_fund)
+        # # 这里添加一项保险，filling fund使用实时的最小值去更新，如果确认参数后，价格上涨较快，到用户点击开始运行时最小资金需求又提高了，则会触发该代码
+        # int((self._x_grid_up_limit - max_filling_price) / self._x_price_abs_step)
+        # real_time_min_fund = calc(self.all_filling_prices[-1], calc(self.filling_grid_step_num, self.symbol_quantity_min_step, '*'), '*')
+        # # todo: 此处不能_log_info,可以考虑写一个弹窗，全局提醒用
+        # self.filling_fund = max(self.filling_fund, real_time_min_fund)
 
         # 计算所有补仓数量
-        self.all_filling_quantities = [int(calc(self.filling_fund, calc(each_fill_price, self.symbol_quantity_min_step, '*'), '/'))
-                                       for each_fill_price in self.all_filling_prices]
+        # self.all_filling_quantities = [int(calc(self.filling_fund, calc(each_fill_price, self.symbol_quantity_min_step, '*'), '/'))
+        #                                for each_fill_price in self.all_filling_prices]
         # print('quantities of filling: {}'.format(self.all_filling_quantities))
 
         # 再计算一阶网格数量，根据网格数量，计算一共有多少张，然后平均分配到网格
-        up_grid_qty = self.unequal_grid_qty_calc(base_price=self.entry_grid_price, grid_num=self.filling_grid_step_num, fund=self.filling_fund)
-        down_grid_qty = [up_grid_qty[0]] * (self.lower_grid_step_num + 1)  # 包含 base index
-        self.all_grid_quantity = tuple(down_grid_qty + up_grid_qty)
-        self.entry_grid_qty = sum(up_grid_qty)
+        # up_grid_qty = self.unequal_grid_qty_calc(base_price=self.entry_grid_price, grid_num=self.filling_grid_step_num, fund=self.filling_fund)
+        # down_grid_qty = [up_grid_qty[0]] * (self.lower_grid_step_num + 1)  # 包含 base index
+        # self.all_grid_quantity = tuple(down_grid_qty + up_grid_qty)
+        # self.entry_grid_qty = sum(up_grid_qty)
         # print('len prices = {}, len qty = {}'.format(len(self.all_grid_price), len(self.all_grid_quantity)))
-
+        self.each_grid_quantity = self.grid_qty_calc(self.entry_grid_price, len(up_grid_price) - 1, self.filling_fund)
+        self.all_grid_quantity = tuple([self.each_grid_quantity, ] * len(self.all_grid_price))
+        # self.entry_grid_qty = self.each_grid_quantity * (len(up_grid_price) - 1)
+        self.entry_grid_qty = sum(self.all_grid_quantity[self.present_base_index:self.zero_pos_index])
+        self.all_filling_quantities = [self.entry_grid_qty, ]
+        print(f'初始数量: {self.entry_grid_qty}')
         # 更新初始统计变量
         self._all_grid_buy_num = [0] * len(self.all_grid_price)
         self._all_grid_sell_num = [0] * len(self.all_grid_price)
@@ -642,31 +662,28 @@ class SmartGridAnalyzerFutures(Analyzer):
             current_price=self.all_grid_price[self.indices_of_filling[0]]
         )]
 
-        self.all_lower_prices = [tuple(self.isometric_grid_calc(
-            self.all_filling_prices[0],
-            self.grid_step_ratio,
-            self.round_step_precision(self.all_filling_prices[0] * (1 - self.lower_space_ratio), self.symbol_price_min_step))[:-1])]
+        # self.all_lower_prices = [tuple(self.isometric_grid_calc(
+        #     self.all_filling_prices[0],
+        #     self.grid_step_ratio,
+        #     self.round_step_precision(self.all_filling_prices[0] * (1 - self.lower_space_ratio), self.symbol_price_min_step))[:-1])]
         self.saved_stair_num = 0
-        # print(self.all_lower_prices)
         # 台阶增长，计算至超出当前挂单最大范围
-        add_num = int(self.symbol_order_price_div / self.filling_step_ratio) + 1
+        # add_num = int(self.symbol_order_price_div / self.filling_step_ratio) + 1
         # print('初始缓冲 {} 阶'.format(add_num))
-        for i in range(add_num):
+        # for i in range(add_num):
+        #     self._add_buffer_vars()
+        while self.saved_stair_num < self.stairs_total_num:
             self._add_buffer_vars()
+        print(f'save stair: {self.saved_stair_num}')
+        # if self._my_operator:
+        #     self._my_operator.deliver_grid_param(grid_prices=self.all_grid_price, grid_quantities=self.all_grid_quantity)
 
     def derive_valid_position(self) -> None:
-        """
-        得到策略当前正确仓位，注意买卖单数量问题
-        :return:
-        """
         if self.critical_index == self.indices_of_filling[0]:
             # 过于偶然，放弃判断，等待下一次判断
             return
 
-        if self.present_stair_num == 0:
-            base_position = self.entry_grid_qty
-        else:
-            base_position = self.all_filling_quantities[self.present_stair_num - 1]
+        base_position = sum(self.all_grid_quantity[self.present_base_index + 1:self.zero_pos_index + 1])
 
         if self.critical_index >= self.present_base_index:
             # 虚拟成交全为卖单
@@ -677,8 +694,9 @@ class SmartGridAnalyzerFutures(Analyzer):
 
         self._current_valid_position = base_position + div_position
 
-        if self._current_valid_position < 0:
-            raise ValueError('仓位小于0，不合逻辑!!!')
+        if self._current_valid_position < 0 and abs(self._current_valid_position) > self.entry_grid_qty:
+            # if abs(self._current_valid_position) > self.entry_grid_qty:
+            raise ValueError(f'仓位数值不合理 valid pos: {self._current_valid_position}')
 
     def stop(self) -> None:
         if self._is_waiting:
@@ -692,7 +710,7 @@ class SmartGridAnalyzerFutures(Analyzer):
             asyncio.create_task(self.command_transmitter(trans_command=maker_order, token=Token.TO_CANCEL))
 
             self._my_logger.close_file()
-            self._my_preserver.stop_preserving()
+            # self._my_preserver.stop_preserving()
 
             self._my_executor.stop_single_contract_order_subscription(self.symbol_name)
             self._my_executor.stop_single_contract_ticker_subscription(self.symbol_name)
@@ -704,21 +722,11 @@ class SmartGridAnalyzerFutures(Analyzer):
             asyncio.create_task(self._terminate_trading(reason='人工手动结束'))
 
     def start(self) -> None:
-        """
-        start 函数连接按钮，由于不确定是挂单还是直接入场，因此改写父类方法
-
-        操作：
-            1. 如果触发挂单，则提交触发挂单并等待触发
-
-            2. 如果直接开启，则市价下单并开启策略
-
-        :return:
-        """
         self._my_logger = LogRecorder()
         self._my_logger.open_file(self.symbol_name)
-        self._my_preserver = Preserver()
-        self._my_preserver.acquire_user_id(self._my_executor.return_user_id())
-        self._my_preserver.open_file(self.symbol_name)  # todo: 改写并测试继承方法，使代码更美观
+        # self._my_preserver = Preserver()
+        # self._my_preserver.acquire_user_id(self._my_executor.return_user_id())
+        # self._my_preserver.open_file(self.symbol_name)
 
         asyncio.create_task(self._my_executor.change_symbol_leverage(self.symbol_name, self.symbol_leverage))
 
@@ -734,7 +742,9 @@ class SmartGridAnalyzerFutures(Analyzer):
             maker_order['side'] = self.BUY
             maker_order['quantity'] = self.entry_grid_qty
             self._log_info('~~~ 触发挂单下单\n')
-            asyncio.create_task(self.command_transmitter(trans_command=maker_order, token=Token.TO_POST_POC))
+            # asyncio.create_task(self.command_transmitter(trans_command=maker_order, token=Token.TO_POST_POC))
+            self._my_operator.deliver_entry_order(entry_price=self.entry_grid_price, entry_qty=self.entry_grid_qty,
+                                                  from_index=self.present_base_index, to_index=self.zero_pos_index)
 
             self._ENTRY_ORDER_qty_left = self.entry_grid_qty
             self._trading_statistics['waiting_start_time'] = self.gen_timestamp()
@@ -747,18 +757,22 @@ class SmartGridAnalyzerFutures(Analyzer):
     async def _start_strategy(self):
         self._is_waiting = False
         self._is_trading = True
-        self._log_info('智能调仓网格 策略开始')
+        self._log_info('智能做市网格 策略开始')
+
+        fee_dict = await self._my_executor.get_symbol_trade_fee(self.symbol_name)
+        self.symbol_maker_fee = fee_dict['maker_fee']
+        self.symbol_taker_fee = fee_dict['taker_fee']
+        self._log_info('maker fee rate: {}'.format(self.symbol_maker_fee))
+        self._log_info('taker fee rate: {}'.format(self.symbol_taker_fee))
+        self._my_operator.set_trade_fee(maker_fee=self.symbol_maker_fee, taker_fee=self.symbol_taker_fee)
+        self._my_operator.start_stg()
 
         self._reasonable_order_num_estimate()
 
         if self.trigger_start:
             self._pre_update_text_task.cancel()
         else:
-            fee_dict = await self._my_executor.get_symbol_trade_fee(self.symbol_name)
-            self.symbol_maker_fee = fee_dict['maker_fee']
-            self.symbol_taker_fee = fee_dict['taker_fee']
-            self._log_info('maker fee rate: {}'.format(self.symbol_maker_fee))
-            self._log_info('taker fee rate: {}'.format(self.symbol_taker_fee))
+            pass
 
         self._update_text_task = asyncio.create_task(self._update_detail_info(interval_time=1))
 
@@ -783,85 +797,72 @@ class SmartGridAnalyzerFutures(Analyzer):
         # 2. 开始撒网
         asyncio.create_task(self._layout_net())
 
-        # 3. 开启维护挂单任务
-        self._fix_order_task = asyncio.create_task(self._order_fixer(interval_time=180))
-
     # strategy basic methods
     def _grid_stair_step_up(self) -> None:
-        """
-        策略上升一个台阶，更新相关变量
-        操作：
-
-            更新所有网格数量(张)
-            pop补仓index
-
-            更新关键index 和price，作为判断标准
-        :return:
-        """
         if self.present_stair_num >= self.stairs_total_num:
             raise ValueError('已达到策略台阶上限，不可调用')
             return
-        upward_grid_num = self.present_step_up_index - self.present_base_index
+        # upward_grid_num = self.present_step_up_index - self.present_base_index
 
-        self.all_grid_price = (0,) * (self.indices_of_filling[0] - len(self.all_lower_prices[self.present_stair_num])) + \
-                              self.all_lower_prices[self.present_stair_num] + self.all_grid_price[self.indices_of_filling[0]:]
+        # self.all_grid_price = (0,) * (self.indices_of_filling[0] - len(self.all_lower_prices[self.present_stair_num])) + \
+        #                       self.all_lower_prices[self.present_stair_num] + self.all_grid_price[self.indices_of_filling[0]:]
 
-        self.all_grid_quantity = (0,) * (self.indices_of_filling[0] - len(self.all_lower_prices[self.present_stair_num])) + \
-                                 (self.all_grid_quantity[self.indices_of_filling[0] + 1],) * (len(self.all_lower_prices[self.present_stair_num]) + 1) + \
-                                 self.all_grid_quantity[self.indices_of_filling[0] + 1:]
-
-        self.present_base_index += upward_grid_num
-        self.present_bottom_index = self.present_base_index - len(self.all_lower_prices[self.present_stair_num])
+        self.present_base_index = self.present_step_up_index
+        up_grid_num = int(calc(calc(self.all_grid_price[self.present_base_index], self.filling_step_ratio, '*'), self.grid_price_step, '/'))
+        self.present_step_up_index += up_grid_num
+        down_grid_num = int(calc(calc(self.all_grid_price[self.present_base_index], self.lower_space_ratio, '*'), self.grid_price_step, '/'))
+        self.present_bottom_index = self.present_base_index - down_grid_num
         # 如果大于max index，数值多少无所谓了
-        self.present_step_up_index = self.indices_of_filling[1] if self.present_stair_num < (self.stairs_total_num - 1) else self.present_base_index + self.filling_grid_step_num
+        self.present_step_up_index = self.indices_of_filling[1] if self.present_stair_num < (self.stairs_total_num - 1) else self.present_base_index + up_grid_num
+        self.zero_pos_index = self.present_base_index + int((self.present_step_up_index - self.present_base_index) * (1 - self.short_ratio))
 
         self.present_step_up_price = self.all_filling_prices[self.present_stair_num + 1] if self.present_stair_num < (self.stairs_total_num - 1) else \
             self.round_step_precision(calc(self.all_filling_prices[-1], 1 + self.filling_step_ratio, '*'), self.symbol_price_min_step)  # 超出上界的台阶价格
         self.present_bottom_price = self.all_grid_price[self.present_bottom_index]
 
+        # self.all_grid_quantity = (0,) * self.present_bottom_index + self.all_grid_quantity[self.present_bottom_index:]
+        self.all_grid_quantity = (0,) * self.present_bottom_index + \
+                                 (self.all_grid_quantity[self.present_base_index + 1],) * (self.present_base_index + 1 - self.present_bottom_index) + \
+                                 self.all_grid_quantity[self.present_base_index + 1:]
+
         # 增添统计数据，并更新
         self._trading_statistics['realized_profit'] = calc(self._trading_statistics['realized_profit'], self._each_stair_profit[self.present_stair_num], '+')
         self._all_grid_sell_num[:self.present_base_index + 1] = [0] * (self.present_base_index + 1)
+        # todo: 对于子账号，订单套利并统计，需要重新计算
 
         self.present_stair_num += 1
         self.indices_of_filling.pop(0)
         self._add_buffer_vars()
 
-    def _add_buffer_vars(self) -> None:
-        """
-        增加相关功能变量的长度，作为缓冲
-        操作：
-            添加所有网格价格，如果到达顶部，则使用上限价格作为最高网格价格
-            添加所有网格数量
-            添加所有下方价格
-            添加补仓index
-            添加买卖单累计列表长度
-            添加每阶做多利润计算
+        print('传参给子账号')
+        self._my_operator.deliver_grid_param(grid_prices=self.all_grid_price, grid_quantities=self.all_grid_quantity)
+        self.send_index()
 
-        :return:
-        """
+    def _add_buffer_vars(self) -> None:
+        # if self.saved_stair_num > self.stairs_total_num:
+        #     raise ValueError('策略保存已达到网格上限')
         if self.saved_stair_num == self.stairs_total_num:
             return
-
         # add_grid_price = ()
         if self.saved_stair_num == self.stairs_total_num - 1:
-            add_grid_price = self.isometric_grid_calc(self.all_filling_prices[self.saved_stair_num], self.grid_step_ratio, self.up_limit_price)[1:]  # 需要剔除base
+            add_grid_price = self.arithmetic_grid_calc(self.all_filling_prices[self.saved_stair_num], self.grid_price_step, self.up_limit_price)[1:]  # 需要剔除base
             if len(add_grid_price) == 0:
                 # 如果补仓价格再往上一个网格，就超出边界，则直接添加一个边界价格的网格
                 add_grid_price.append(self.up_limit_price)
             else:
                 add_grid_price[-1] = self.up_limit_price
-            up_step_low_prices = ()
-            filling_grid_num = self.filling_grid_step_num  # 该变量，使得最高台阶时，每格数量仍然合理
+            # up_step_low_prices = ()
+            # filling_grid_num = self.filling_grid_step_num  # 该变量，使得最高台阶时，每格数量仍然合理
+            filling_grid_num = len(self.arithmetic_grid_calc(self.all_filling_prices[-1], self.grid_price_step, self.all_filling_prices[-1] * (1 + self.filling_step_ratio))) - 1
 
         elif self.saved_stair_num < self.stairs_total_num - 1:
-            add_grid_price = self.isometric_grid_calc(self.all_filling_prices[self.saved_stair_num],
-                                                      self.grid_step_ratio, self.all_filling_prices[self.saved_stair_num + 1])[1:]
+            add_grid_price = self.arithmetic_grid_calc(self.all_filling_prices[self.saved_stair_num],
+                                                       self.grid_price_step, self.all_filling_prices[self.saved_stair_num + 1])[1:]
             add_grid_price[-1] = self.all_filling_prices[self.saved_stair_num + 1]
-            up_step_low_prices = tuple(self.isometric_grid_calc(
-                self.all_filling_prices[self.saved_stair_num + 1],
-                self.grid_step_ratio,
-                self.round_step_precision(self.all_filling_prices[self.saved_stair_num + 1] * (1 - self.lower_space_ratio), self.symbol_price_min_step))[:-1])  # 不包括base
+            # up_step_low_prices = tuple(self.isometric_grid_calc(
+            #     self.all_filling_prices[self.saved_stair_num + 1],
+            #     self.grid_step_ratio,
+            #     self.round_step_precision(self.all_filling_prices[self.saved_stair_num + 1] * (1 - self.lower_space_ratio), self.symbol_price_min_step))[:-1])  # 不包括base
 
             filling_grid_num = len(add_grid_price)
 
@@ -870,13 +871,18 @@ class SmartGridAnalyzerFutures(Analyzer):
             return
 
         # 切片以使得长度相等
-        add_grid_qty = tuple(self.unequal_grid_qty_calc(self.all_filling_prices[self.saved_stair_num], filling_grid_num, self.filling_fund))[:len(add_grid_price)]
+        # add_grid_qty = tuple(self.unequal_grid_qty_calc(self.all_filling_prices[self.saved_stair_num], filling_grid_num, self.filling_fund))[:len(add_grid_price)]
+        add_grid_qty = tuple([self.grid_qty_calc(self.all_filling_prices[self.saved_stair_num], filling_grid_num, self.filling_fund), ] * filling_grid_num)
+        add_filling_qty = int(sum(add_grid_qty) * (1 - self.short_ratio))
+        add_grid_qty = add_grid_qty[:len(add_grid_price)]
 
         self.all_grid_price += tuple(add_grid_price)
         self.all_grid_quantity += add_grid_qty
-        if not up_step_low_prices == ():
-            self.all_lower_prices.append(up_step_low_prices)
+        # if not up_step_low_prices == ():
+        #     self.all_lower_prices.append(up_step_low_prices)
         self.indices_of_filling.append(self.indices_of_filling[-1] + filling_grid_num)  # 会超出max index
+        self.all_filling_quantities.append(add_filling_qty)
+        self.max_index = len(self.all_grid_price) - 1
         self._all_grid_buy_num += [0] * len(add_grid_price)
         self._all_grid_sell_num += [0] * len(add_grid_price)
         self._each_stair_profit.append(self.unmatched_profit_calc(
@@ -885,11 +891,15 @@ class SmartGridAnalyzerFutures(Analyzer):
             all_prices=self.all_grid_price,
             all_quantities=self.all_grid_quantity,
             init_pos_price=self.all_grid_price[self.indices_of_filling[-2]],
-            init_pos_qty=sum(add_grid_qty),
+            init_pos_qty=add_grid_qty[-1] * int(len(add_grid_qty) * (1 - self.short_ratio)),
             current_price=self.all_grid_price[self.indices_of_filling[-1]] if self.saved_stair_num < self.stairs_total_num - 1 else self.up_limit_price
         ))
 
         self.saved_stair_num += 1
+        # 简单粗暴直接最后一次赋值
+        if self._my_operator and self.saved_stair_num == self.stairs_total_num:
+            print('传参给子账号')
+            self._my_operator.deliver_grid_param(grid_prices=self.all_grid_price, grid_quantities=self.all_grid_quantity)
 
     async def _layout_net(self):
         """
@@ -912,7 +922,7 @@ class SmartGridAnalyzerFutures(Analyzer):
                 'time': self.gen_timestamp()
             } for _index in range(self.critical_index + 1, min(self.max_index, (self.critical_index + ini_sell_order_num + 1)))
         ]
-        self._log_info('\n开始撒网\n')
+        self._log_info('\n开始多账号撒网\n')
         temp_buy_indices = [_each for _each in self.open_buy_orders]
         temp_sell_indices = [_each for _each in self.open_sell_orders]
         while True:
@@ -926,7 +936,7 @@ class SmartGridAnalyzerFutures(Analyzer):
                         'id': each['id'],
                         'price': self.all_grid_price[self.parse_id(each['id'])[0]],
                         'side': self.BUY,
-                        'quantity': self.all_grid_quantity[self.parse_id(each['id'])[0] + 1],
+                        'quantity': self.all_grid_quantity[self.parse_id(each['id'])[0] + 1],  # todo: 对于+1后续再检查
                         'status': Token.TO_POST_POC
                     } for each in temp_post_buy
                 ]
@@ -955,51 +965,27 @@ class SmartGridAnalyzerFutures(Analyzer):
         self._layout_complete = True
 
     def _reasonable_order_num_estimate(self):
-        """
-        根据当前价格，挂单数量限制，以及价格范围限制设置合理的最大挂单数量
-        此时需要已知合约规则和当前价格
-        警告：该方法未考虑非线性网格间距，只适用于线性网格       todo: 使用更好的方法
-        :return:
-        """
-        if self.symbol_orders_limit_num != 100 and self.max_buy_order_num > int(self.symbol_orders_limit_num / 2):
-            self._log_info('\n*** ================================= ***\n')
-            self._log_info('请注意该合约挂单数量限制为 {} ! \n已自动减少缓冲网格数量，请留意交易情况!'.format(self.symbol_orders_limit_num))
-            self._log_info('\n*** ================================= ***\n')
-            self.max_buy_order_num = self.max_sell_order_num = int(self.symbol_orders_limit_num * 0.8 / 2)
-            self.min_buy_order_num = self.min_sell_order_num = int(self.symbol_orders_limit_num * 0.4 / 2)
-            self.buffer_buy_num = self.buffer_sell_num = max(3, int(self.min_buy_order_num / 2))
-
-        price_div_demand_side_order_max_num = \
-            int(self.current_symbol_price * self.symbol_order_price_div / calc(self.all_grid_price[self.critical_index + 1], self.all_grid_price[self.critical_index], '-'))
-        if price_div_demand_side_order_max_num <= 0:
-            raise ValueError('挂单数量不正确')
-        if self.max_buy_order_num > price_div_demand_side_order_max_num:
-            self._log_info('\n*** ================================= ***\n')
-            self._log_info('请注意价格限制合约挂单数量为 {} ! 已自动减少网格数量'.format(price_div_demand_side_order_max_num))
-            self._log_info('\n*** ================================= ***\n')
-            self.max_buy_order_num = self.max_sell_order_num = int(price_div_demand_side_order_max_num * 0.95)
-            self.min_buy_order_num = self.min_sell_order_num = int(price_div_demand_side_order_max_num * 0.42)
-            self.buffer_buy_num = self.buffer_sell_num = max(2, int(self.min_buy_order_num / 2))
-
-        if price_div_demand_side_order_max_num > int(self.symbol_orders_limit_num / 2) and self.max_buy_order_num < int(self.symbol_orders_limit_num * 0.7 / 2):
-            self._log_info('\n*** 价格限制充裕，增加网格挂单数量 ***\n')
-            self.max_buy_order_num = self.max_sell_order_num = int(self.symbol_orders_limit_num * 0.8 / 2)
-            self.min_buy_order_num = self.min_sell_order_num = int(self.symbol_orders_limit_num * 0.4 / 2)
-            self.buffer_buy_num = self.buffer_sell_num = max(3, int(self.min_buy_order_num / 2))
+        # 新策略根据账户数量设定挂单数量.注意：只限用于100挂单限制的btc，做多方向，空单更多
+        # self.max_buy_order_num = self.max_sell_order_num = int(self.symbol_orders_limit_num * 0.8 / 2) * self._account_num
+        self.max_buy_order_num = int(self.symbol_orders_limit_num * 0.6 / 2) * self._account_num
+        self.max_sell_order_num = int(self.symbol_orders_limit_num * 1.2 / 2) * self._account_num
+        # self.min_buy_order_num = self.min_sell_order_num = int(self.symbol_orders_limit_num * 0.4 / 2) * self._account_num
+        self.min_buy_order_num = int(self.symbol_orders_limit_num * 0.3 / 2) * self._account_num
+        self.min_sell_order_num = int(self.symbol_orders_limit_num * 0.6 / 2) * self._account_num
+        # self.buffer_buy_num = self.buffer_sell_num = max(10, int(self.min_buy_order_num / 2))
+        self.buffer_buy_num = max(10, int(self.min_buy_order_num / 2))
+        self.buffer_sell_num = max(10, int(self.min_sell_order_num / 2))
 
     async def _post_market_order(self, market_side: str, market_qty: int) -> None:
-        """
-        发送市价请求并更新相关统计信息，使程序更简化
-        :param market_side:
-        :param market_qty:
-        :return:
-        """
+        # 该方法仅适用于策略市价补仓!
+        # await self.send_index()
         command = Token.ORDER_INFO.copy()
         command['side'] = market_side
         command['quantity'] = market_qty
         self._log_info('市价下单 {} 张'.format(market_qty))
-        await self.command_transmitter(trans_command=command, token=Token.TO_POST_MARKET)
+        # await self.command_transmitter(trans_command=command, token=Token.TO_POST_MARKET)
         self._MARKET_ORDER_qty_target = self._MARKET_ORDER_qty_left = market_qty
+        self._my_operator.deliver_market_order(market_side, market_qty, self.present_base_index, self.zero_pos_index)
 
         if market_side == self.BUY:
             self._account_position_theory += market_qty
@@ -1345,7 +1331,7 @@ class SmartGridAnalyzerFutures(Analyzer):
                     cancel_cmd['symbol'] = self.symbol_name
                     cancel_cmd['id'] = each_info['id']
                     await self.command_transmitter(trans_command=cancel_cmd, token=Token.TO_CANCEL)
-                    self._cancel_partial_order_check(each_info['id'])
+                    # self._cancel_partial_order_check(each_info['id'])
                     # if each_info['id'] in self.partially_filled_orders.keys():
                     #     traded_qty = int(self.grid_each_qty) - self.partially_filled_orders[each_info['id']]
                     #     self._accumulated_pos_deviation -= traded_qty
@@ -1396,11 +1382,7 @@ class SmartGridAnalyzerFutures(Analyzer):
                     cancel_cmd['symbol'] = self.symbol_name
                     cancel_cmd['id'] = each_info['id']
                     await self.command_transmitter(trans_command=cancel_cmd, token=Token.TO_CANCEL)
-                    self._cancel_partial_order_check(each_info['id'])
-                    # if each_info['id'] in self.partially_filled_orders.keys():
-                    #     traded_qty = int(self.grid_each_qty) - self.partially_filled_orders[each_info['id']]
-                    #     self._accumulated_pos_deviation += traded_qty
-                    #     self.partially_filled_orders.pop(each_info['id'])
+                    # self._cancel_partial_order_check(each_info['id'])
 
             elif len(self.open_sell_orders) < self.min_sell_order_num:
                 if len(self.open_sell_orders) == 0:
@@ -1474,7 +1456,7 @@ class SmartGridAnalyzerFutures(Analyzer):
 
     async def _repost_under_orders(self) -> None:
         """
-        当网格到达补仓点位时，下方的等比网格数量和价格都需要修改
+        当网格到达补仓点位时，下方的等比网格数量需要修改
         因此撤销所有买单，并重新挂买单。
         台阶维护操作发生在网格维护之前，因此读取open buy orders的所有index，筛选(c index - base index 之间)并重新挂单即可
         由于有延时操作，该方法使用创建协程任务调用。该方法在高频时可能会存在撤单失败和挂单失败的情况
@@ -1489,25 +1471,13 @@ class SmartGridAnalyzerFutures(Analyzer):
             # repost_buy_indices = repost_buy_indices[over_border_num:]
         repost_buy_orders = self.open_buy_orders.copy()
 
-        # 判断修正仓位挂单，如果存在，则撤销
-        if not self.adjusting_index == -1:
-            if self.adjusting_index in repost_buy_indices:
-                self.adjusting_index = -1
-                # 使用加号，防止在请求期间存在其他的仓位偏移来源
-                self._accumulated_pos_deviation += self._pre_save_acc_pos_dev
-                self._log_info('##### 重新挂单，撤销仓位修正')
-
         # 撤销挂单，使用open buy变量即可
         for each_info in reversed(self.open_buy_orders):
             cancel_cmd = Token.ORDER_INFO.copy()
             cancel_cmd['symbol'] = self.symbol_name
             cancel_cmd['id'] = each_info['id']
             await self.command_transmitter(trans_command=cancel_cmd, token=Token.TO_CANCEL)
-            self._cancel_partial_order_check(each_info['id'])
-            # if each_info['id'] in self.partially_filled_orders.keys():
-            #     traded_qty = int(self.grid_each_qty) - self.partially_filled_orders[each_info['id']]
-            #     self._accumulated_pos_deviation -= traded_qty           # 部分成交买单，如此计算
-            #     self.partially_filled_orders.pop(each_info['id'])
+
         # 撤单后停顿
         await asyncio.sleep(0.5)
         # 重新撒网下部分，由于时间停顿，使用复制变量操作
@@ -1538,21 +1508,19 @@ class SmartGridAnalyzerFutures(Analyzer):
                 self._log_info('--- 用户强行终止策略，请自行平仓和撤销挂单')
                 if isinstance(self._update_text_task, asyncio.Task):
                     self._update_text_task.cancel()
-                if isinstance(self._fix_order_task, asyncio.Task):
-                    self._fix_order_task.cancel()
 
                 self.force_stopped = True
                 self._my_logger.close_file()
-                self._my_preserver.stop_preserving()
+                # self._my_preserver.stop_preserving()
                 self._my_executor.stop_single_contract_order_subscription(self.symbol_name)
                 self._my_executor.stop_single_contract_ticker_subscription(self.symbol_name)
                 self._my_executor.strategy_stopped(self.stg_num)
-                self._bound_running_column = None
+                # self._bound_running_column = None
             return
         self._is_trading = False
 
-        self._update_text_task.cancel()
-        self._fix_order_task.cancel()
+        if isinstance(self._update_text_task, asyncio.Task):
+            self._update_text_task.cancel()
 
         cancel_cmd, close_cmd = Token.ORDER_INFO.copy(), Token.ORDER_INFO.copy()
         cancel_cmd['symbol'], close_cmd['symbol'] = self.symbol_name, self.symbol_name
@@ -1563,31 +1531,23 @@ class SmartGridAnalyzerFutures(Analyzer):
         await asyncio.sleep(1)
 
         self._log_info('--- 市价平仓')
-        # self._log_info('--- 策略开始前账户仓位:\t{}\t张'.format(self._init_account_position))
-        self._log_info('--- 累计理论计算当前仓位:\t{}\t张'.format(self._account_position_theory))
-        current_position = await self._my_executor.get_symbol_position(self.symbol_name)
-        self._log_info('--- 账户实际当前合约仓位:\t{}\t张'.format(current_position))
+        self._log_info('--- 主账户不统计平仓带来的手续费和交易量')
 
-        close_qty = current_position - self._init_account_position
-        self._log_info('--- 实际市价平掉仓位 {}'.format(str(close_qty)))
         await self.command_transmitter(trans_command=close_cmd, token=Token.CLOSE_POSITION)
-
-        adding_volume = calc(calc(close_qty, self.symbol_quantity_min_step, '*'), self.current_symbol_price, '*')
-        self._trading_statistics['achieved_trade_volume'] = calc(self._trading_statistics['achieved_trade_volume'], adding_volume, '+')
-        self._trading_statistics['total_trading_fees'] = calc(self._trading_statistics['total_trading_fees'], calc(adding_volume, self.symbol_taker_fee, '*'), '+')
 
         self._log_info('--- 终止策略，终止原因: {}'.format(reason))
         await self._update_detail_info(only_once=True)
 
         if not self.force_stopped:
             self._my_logger.close_file()
-            self._my_preserver.stop_preserving()
+            # self._my_preserver.stop_preserving()
             self._my_executor.stop_single_contract_order_subscription(self.symbol_name)
             self._my_executor.stop_single_contract_ticker_subscription(self.symbol_name)
             self._my_executor.strategy_stopped(self.stg_num)
 
-            # todo: 此处或许应该在基类中定义
-            self._bound_running_column = None
+            # self._bound_running_column = None
+
+        self._my_operator.terminate()
 
     async def _update_trading_statistics(self) -> None:
         """
@@ -1609,7 +1569,7 @@ class SmartGridAnalyzerFutures(Analyzer):
                                             calc(self.all_grid_quantity[i + 1], self.symbol_quantity_min_step, '*'), '*'), matched_num, '*')
                 # profit_per_pair = (self.all_grid_price[i + 1] - self.all_grid_price[i]) * self.all_grid_quantity[i + 1] * matched_num
                 add_matched_profit = calc(add_matched_profit, profit_per_pair, '+')
-            elif matched_num < 0:  # todo: delete if not happened
+            elif matched_num < 0:
                 raise ValueError('成交对数小于0，统计错误!!!')
         self._trading_statistics['matched_profit'] = calc(self._trading_statistics['matched_profit'], add_matched_profit, '+')
 
@@ -1634,7 +1594,7 @@ class SmartGridAnalyzerFutures(Analyzer):
 
         while True:
             await self._update_trading_statistics()
-            self._update_column_text()
+            # self._update_column_text()
             self._save_strategy_data()
 
             start_t = pd.to_datetime(self._trading_statistics['strategy_start_time'], unit='ms')
@@ -1659,11 +1619,11 @@ class SmartGridAnalyzerFutures(Analyzer):
             showing_texts += '\n\n策略记忆价格:\t{:<10}\n'.format(str(self.all_grid_price[self.critical_index]))
             showing_texts += '合约最新价格:\t{:<10}\n\n'.format(str(self.current_symbol_price))
             showing_texts += '-' * 58
-            showing_texts += '\n\n修正仓位挂单:\t\t{}\n'.format(False if self.adjusting_index == -1 else True)
-            showing_texts += '当前正确仓位:\t\t{:<10}张\n'.format(self._current_valid_position)
-            showing_texts += '累计计算仓位:\t\t{:<10}张\n'.format(self._account_position_theory)
-            showing_texts += '累计仓位偏移:\t\t{:<10}张\n\n'.format(self._accumulated_pos_deviation)
-            showing_texts += '部分成交订单:\t\t{:<10}个挂单\n\n'.format(len(self.partially_filled_orders))
+            # showing_texts += '\n\n修正仓位挂单:\t\t{}\n'.format(False if self.adjusting_index == -1 else True)
+            showing_texts += '\n\n当前正确仓位:\t\t{:<10}张\n\n'.format(self._current_valid_position)
+            # showing_texts += '累计计算仓位:\t\t{:<10}张\n'.format(self._account_position_theory)
+            # showing_texts += '累计仓位偏移:\t\t{:<10}张\n\n'.format(self._accumulated_pos_deviation)
+            # showing_texts += '部分成交订单:\t\t{:<10}个挂单\n\n'.format(len(self.partially_filled_orders))
 
             showing_texts += '-' * 58
             showing_texts += '\n\n卖单挂单成交次数:\t{:<10}\n'.format(str(self._trading_statistics['filled_sell_order_num']))
@@ -1671,21 +1631,20 @@ class SmartGridAnalyzerFutures(Analyzer):
             showing_texts += '-' * 58
             showing_texts += '\n\n已补仓次数:\t\t{} / {}\n'.format(self.present_stair_num, self.stairs_total_num)
             showing_texts += '当前套利区间:\t\t{:<10} ~  {:<10}\n'.format(self.present_bottom_price, self.present_step_up_price)
-            showing_texts += '\n已达成交易量:\t\t{:<20}\t{}\n\n'.format(str(self._trading_statistics['achieved_trade_volume']), self.symbol_name[-4:])
+            showing_texts += '\n总达成交易量:\t\t{:<20}\t{}\n\n'.format(str(self._trading_statistics['achieved_trade_volume']), self.symbol_name[-4:])
             showing_texts += '-' * 58
             showing_texts += '\n\n套利收益:\t\t{:<20}\t{}\n'.format(self._trading_statistics['matched_profit'], self.symbol_name[-4:])
             showing_texts += '做多收益:\t\t{:<20}\t{}\n'.format(self._trading_statistics['realized_profit'], self.symbol_name[-4:])
 
             # 如果价格下冲超出下边界，提示一下
             if self.current_symbol_price <= self.present_bottom_price:
-                showing_texts += '未实现盈亏:\t\t{:<20}\t{} (价格走出下区间)\n\n'.format(
+                showing_texts += '未实现盈亏:\t\t{:<20}\t{} (价格走出下区间!)\n'.format(
                     self._trading_statistics['unrealized_profit'], self.symbol_name[-4:])
             else:
-                showing_texts += '未实现盈亏:\t\t{:<20}\t{}\n\n'.format(self._trading_statistics['unrealized_profit'], self.symbol_name[-4:])
-
+                showing_texts += '未实现盈亏:\t\t{:<20}\t{}\n'.format(self._trading_statistics['unrealized_profit'], self.symbol_name[-4:])
+            showing_texts += '\n交易手续费:\t\t{:<20}\t{}\n\n'.format(self._trading_statistics['total_trading_fees'], self.symbol_name[-4:])
             showing_texts += '-' * 58
-            showing_texts += '\n\n交易手续费:\t\t{:<20}\t{}\n'.format(self._trading_statistics['total_trading_fees'], self.symbol_name[-4:])
-            showing_texts += '\n策略净收益:\t\t{:<20}\t{}\n\n'.format(self._trading_statistics['final_profit'], self.symbol_name[-4:])
+            showing_texts += '\n\n策略净收益:\t\t{:<20}\t{}\n\n'.format(self._trading_statistics['final_profit'], self.symbol_name[-4:])
             showing_texts += '*** {} ***\n\n'.format('=' * 51)
 
             self._bound_running_column.update_trade_info(showing_texts)
@@ -1731,462 +1690,21 @@ class SmartGridAnalyzerFutures(Analyzer):
 
             await asyncio.sleep(interval_time)
 
-    def _update_column_text(self):
-        """
-        更新 column 显示的策略收益
-        :return:
-        """
-        # todo: 考虑使用pandas
-        self._bound_running_column.update_profit_text(
-            matched_profit=str(calc(self._trading_statistics['matched_profit'], self._trading_statistics['realized_profit'], '+')),
-            unmatched_profit=str(self._trading_statistics['unrealized_profit'])
-        )
-
-    async def show_final_statistics(self) -> str:
-        """
-        策略结束后，输出最终统计信息
-        :return:
-        """
-        # 使用该变量判断策略是运行前停止还是运行后停止
-        if self._is_waiting:
-            return str(0)
-        else:
-            await self._update_trading_statistics()
-            return str(self._trading_statistics['final_profit'])
-
     def _save_strategy_data(self) -> None:
-        stg_param_dict = {
-            'symbol_name': self.symbol_name,
-            'up_price': self._x_grid_up_limit,
-            'leverage': self._x_leverage,
-            'trigger_start': self._x_trigger_start,  # 是否用挂单触发, True/False
-            'pending_trigger_price': self._x_trigger_price,
-
-            'grid_rel_step': self._x_price_rel_step,
-            'filling_step': self._x_filling_step,
-            'lower_step': self._x_lower_step,
-            'filling_fund': self._x_filling_fund
-        }
-
-        strategy_info = {
-            'channel': 'futures',
-            'stg_name': self.STG_NAME,
-            'symbol_name': self.symbol_name,
-            'stg_params': stg_param_dict,
-            'stg_entry_price': self.entry_grid_price,
-            'present_stair_num': self.present_stair_num,
-            'current_symbol_price': self.current_symbol_price,
-            'stg_statistics': self._trading_statistics,
-            'is_waiting': self._is_waiting,
-            'is_trading': self._is_trading,
-            'ref_info_texts': self._save_ref_info_text
-        }
-        self._my_preserver.preserve_strategy_info(strategy_info)
+        pass
 
     async def restart(self, stg_info: dict, save_file_name: str) -> bool:
-        """
-        使用已保存的策略信息重新开启策略
-        重启网格相当于开启了一个新的网格，并重新计算
-        :return:
-        """
-        restart_success = True
-
-        try:
-            stg_params = stg_info['stg_params']
-            stg_statistics = stg_info['stg_statistics']
-            # 确保重启后，仍然能保存参考信息，用于下一次重启。因此策略可以无限制重启！
-            self._save_ref_info_text = stg_info['ref_info_texts'] if 'ref_info_texts' in stg_info.keys() else ''
-
-            self.symbol_name = stg_info['symbol_name']  # 在重启时也定义了实例的合约名称，此步多余
-            # 获取新的记录参数实例
-            self._my_logger = LogRecorder()
-            self._my_logger.open_file(self.symbol_name)
-
-            self._log_info('\n\\(✿◕‿◕)/ 智能调仓网格 策略重启!\n')
-
-            # 策略初始参数
-            self._x_grid_up_limit = stg_params['up_price']
-            self._x_leverage = stg_params['leverage']
-            self._x_trigger_start = stg_params['trigger_start']
-            self._x_trigger_price = stg_params['pending_trigger_price']
-            self._x_price_rel_step = stg_params['grid_rel_step']
-            self._x_filling_step = stg_params['filling_step']
-            self._x_lower_step = stg_params['lower_step']
-            self._x_filling_fund = stg_params['filling_fund']
-
-            # 由于一般而言策略重启间隔时间比较短，不开发恢复正在挂单等待的策略
-            if stg_info['is_waiting']:
-                self._log_info('该策略处于挂单等待触发状态，恢复功能尚未开发，请手动重启')
-                return False
-
-            # 按照开启策略的步骤一步步重启
-            self._my_executor.start_single_contract_order_subscription(self.symbol_name)
-            self._my_executor.start_single_contract_ticker_subscription(self.symbol_name)
-            await self._get_trading_rule(self.symbol_name)
-            # 得到初始时的所有网格参数变量
-            self.derive_functional_variables(assign_entry_price=stg_info['stg_entry_price'])
-            # 按照当前价格演化台阶价格变化
-            self.current_symbol_price = await self._my_executor.get_current_price(self.symbol_name)
-            self._log_info('策略停止时合约价格\t{}\n当前合约价格\t\t{}'.format(str(stg_info['current_symbol_price']), str(self.current_symbol_price)))
-            self._log_info('\n停止期间价格变化了\t{} %'.format(round((self.current_symbol_price - stg_info['current_symbol_price']) * 100 / stg_info['current_symbol_price'], 2)))
-            # 首先根据历史，移动台阶
-            for i in range(int(stg_info['present_stair_num'])):
-                self._log_info('复原台阶上移操作')
-                self._grid_stair_step_up()
-            # 然后补充策略停止期间应该操作的台阶上移
-            if self.current_symbol_price >= self._x_grid_up_limit:
-                # 无意义的重启也需要添加进栏目，方便观察启动记录
-                self._log_info('\n当前价已高于策略上限价格，无需重启策略')
-                self._log_info('\n请手动平仓')
-                return False
-            else:
-                while self._x_grid_up_limit > self.current_symbol_price >= self.present_step_up_price:
-                    self._log_info('补充策略停止期间的台阶上移操作')
-                    self._grid_stair_step_up()
-            # 获得 c index
-            self.critical_index = -1
-            for each_index in range(1, len(self.all_grid_price)):
-                if self.all_grid_price[each_index - 1] < self.current_symbol_price <= self.all_grid_price[each_index]:
-                    self.critical_index = each_index
-            if self.critical_index == -1:
-                # 匹配价格失败
-                self._log_info('未匹配到当前价格，c index失效')
-                return False
-            # 获得详细统计信息
-            self._trading_statistics['waiting_start_time'] = stg_statistics['waiting_start_time']
-            self._trading_statistics['strategy_start_time'] = stg_statistics['strategy_start_time']
-            self._trading_statistics['filled_buy_order_num'] = stg_statistics['filled_buy_order_num']
-            self._trading_statistics['filled_sell_order_num'] = stg_statistics['filled_sell_order_num']
-            self._trading_statistics['achieved_trade_volume'] = stg_statistics['achieved_trade_volume']
-            self._trading_statistics['matched_profit'] = stg_statistics['matched_profit']
-            self._trading_statistics['realized_profit'] = stg_statistics['realized_profit']
-            self._trading_statistics['unrealized_profit'] = stg_statistics['unrealized_profit']
-            self._trading_statistics['total_trading_fees'] = stg_statistics['total_trading_fees']
-            self._trading_statistics['final_profit'] = stg_statistics['final_profit']
-
-            self._log_info('\n策略恢复中。。。')
-            # 设置合理挂单数量
-            self._reasonable_order_num_estimate()
-
-            self._my_preserver = Preserver()
-            self._my_preserver.acquire_user_id(self._my_executor.return_user_id())
-            self._my_preserver.use_existing_file(save_file_name)
-
-            self._update_text_task = asyncio.create_task(self._update_detail_info(interval_time=1))
-
-            # 重启网格并获得正确仓位
-            cancel_cmd = Token.ORDER_INFO.copy()
-            cancel_cmd['symbol'] = self.symbol_name
-            await self.command_transmitter(trans_command=cancel_cmd, token=Token.CANCEL_ALL)
-            await asyncio.sleep(1)
-            self.derive_valid_position()
-
-            self._is_trading = True
-            self._is_waiting = False
-            self._layout_complete = False
-            # 虽然重启了，也让统计数据好看一些      todo: 同时更新参考信息
-            self._account_position_theory = await self._my_executor.get_symbol_position(self.symbol_name)
-
-            await self._layout_net()
-
-            self._fix_order_task = asyncio.create_task(self._order_fixer(interval_time=180))
-
-            self._log_info('$$$ 策略恢复: 网格重启完成')
-            # 最后将相关变量归位，并需要调整仓位
-            self._reset_functional_vars()
-            self._need_adjust_pos = True
-        except Exception as e:
-            print('{} 策略重启失败!'.format(self.symbol_name))
-            print(e, type(e))
-            restart_success = False
-
-        return restart_success
+        pass
 
     def restart_failed(self) -> None:
-        """
-        如果策略重启失败，模仿策略终止操作，但是程序上会简单一些
-        :return:
-        """
-        self._is_trading = False
-        # 防止调用策略统计功能
-        self._is_waiting = True
-
-        if self._update_text_task:
-            self._update_text_task.cancel()
-        if self._fix_order_task:
-            self._fix_order_task.cancel()
-
-        if self._my_logger:
-            self._my_logger.close_file()
-        if self._my_preserver:
-            self._my_preserver.failed_to_preserve()
-        self._my_executor.strategy_stopped(self.stg_num)
-        self._bound_running_column = None
+        pass
 
     # functional methods
     async def _check_position(self) -> None:
-        """
-        每隔一段交易量，自动修正仓位，该方法在策略不繁忙时执行
-        注意，假设所有的仓位偏移都已知并被记录，没有出现未知来源的仓位偏移，则：
-        current_account_qty: 实时读取到的当前账户实际仓位
-        accumulated_pos_deviation: 程序累计计算的仓位偏移，来自于所有已知的带来仓位偏移情况
-        current_valid_pos: 策略运行至此，如果完全理想，则当前应有的仓位
-
-        current_valid_pos = current_account_qty + accumulated_pos_deviation
-        因此等式两边的差值就是未知来源的仓位偏移
-
-        操作：将所有仓位偏移计算后，记录到 accumulated_pos_deviation 变量当中，后续根据该变量调整仓位
-        :return:
-        """
-        start_t = self._running_loop.time()
-        current_account_qty = await self._my_executor.get_symbol_position(self.symbol_name)  # todo: 测试延时
-        end_t = self._running_loop.time()
-        elapsed_t_ms = int((end_t - start_t) * 1000)
-        self._log_info('>>> 获取仓位耗时: {} ms'.format(elapsed_t_ms))
-
-        self.derive_valid_position()
-        self._log_info('\n### 执行仓位修正:')
-        # self._log_info('### 账户初始仓位:\t\t{}\t张'.format(self._init_account_position))
-        self._log_info('### 累计理论当前仓位:\t\t{}\t张'.format(self._account_position_theory))
-        self._log_info('### 账户实际当前仓位:\t\t{}\t张\n'.format(current_account_qty))
-        # 这两行不相等，说明正向理论计算当前仓位存在遗漏或者偏差
-
-        partial_order_pos_dev: int = 0
-        if len(self.partially_filled_orders) > 0:
-            for each_id, each_qty in self.partially_filled_orders.items():
-                if self.parse_id(each_id)[1] == self.BUY:
-                    # 部分买单成交表示需要立即卖出，因此为负数
-                    partial_order_pos_dev -= each_qty
-                else:
-                    partial_order_pos_dev += each_qty
-
-        # self._log_info('### 除去已知偏差后:\t\t{}\t张'.format(str(self._account_position_theory + self._accumulated_pos_deviation)))
-        self._log_info('### 策略当前正确仓位:\t\t{}\t张'.format(self._current_valid_position))
-        self._log_info('### 当前矫正后仓位: \t\t{}\t张'.format(str(current_account_qty + self._accumulated_pos_deviation + partial_order_pos_dev)))
-        # 后两行如果不相等，则表示反向计算累计仓位偏移不完备，存在未知的仓位偏移来源
-
-        fix_qty = int(current_account_qty + self._accumulated_pos_deviation + partial_order_pos_dev - self._current_valid_position)
-        # fix_qty 大于 0 表示 修正后 账户多余仓位，小于0 表示 修正后 账户缺少仓位
-
-        if fix_qty == 0:
-            self._log_info('\n### 无额外仓位偏移')
-        else:
-            self._log_info('\n##### 存在未知来源的仓位偏移 #####')
-            if fix_qty > 0:
-                self._log_info('##### 账户多余仓位 {} 张 #####'.format(str(fix_qty)))
-            else:
-                self._log_info('##### 账户缺失仓位 {} 张 #####'.format(str(abs(fix_qty))))
-
-            self._accumulated_pos_deviation -= fix_qty
+        pass
 
     async def _check_open_orders(self) -> None:
-        """
-        协程方式检查策略挂单，将挂单修正至正常
-
-        操作：
-            1. 如果价格偏离记录价格较多，则说明挂单非常失败，直接撤销所有挂单，并重新layout    todo: layout 修改，以及钉钉提醒机器人
-
-            否则
-            2. 如果没有偏移，则
-                获取实际挂单id list
-
-                2.1 先检查实际挂单，剔除账户上的多余挂单
-                2.2 再使用理论记录的挂单，补充缺少挂单
-
-        :return:
-        """
-        if self._cannot_check_open_orders:
-            self._log_info('$$$ 检查挂单操作被禁止，等待下一回合')
-            return
-        # 此处最少约有100ms的延时
-
-        # 1. 价格偏移较大情况
-        if 1 <= self.critical_index <= self.max_index - 1:
-            if abs(calc(self.current_symbol_price, self.all_grid_price[self.critical_index], '-')) > \
-                    5 * calc(self.all_grid_price[self.critical_index + 1], self.all_grid_price[self.critical_index - 1], '-'):
-                self._log_info('$$$ 价格偏离较大: 最新价 {}; 策略价 {}, 直接重新开启网格!'.format(self.current_symbol_price, self.all_grid_price[self.critical_index]))
-
-                # 撤销所有挂单
-                cancel_cmd = Token.ORDER_INFO.copy()
-                cancel_cmd['symbol'] = self.symbol_name
-                await self.command_transmitter(trans_command=cancel_cmd, token=Token.CANCEL_ALL)
-                await asyncio.sleep(1)
-
-                self.current_symbol_price = await self._my_executor.get_current_price(self.symbol_name)
-                # 获得 c index
-                for each_index in range(len(self.all_grid_price) - 1):
-                    if self.all_grid_price[each_index] <= self.current_symbol_price < self.all_grid_price[each_index + 1]:
-                        self.critical_index = each_index
-
-                self.derive_valid_position()
-
-                self._layout_complete = False
-                await self._layout_net()
-
-                self._log_info('$$$ 重启网格完成')
-                # 最后将相关变量归位
-                self._reset_functional_vars()
-                return
-
-        start_t = self._running_loop.time()
-        # account_orders_list, account_orders_list_id = await self._my_executor.get_open_orders(self.symbol_name)
-        account_open_orders = await self._my_executor.get_open_orders_beta(self.symbol_name)
-        end_t = self._running_loop.time()
-        elapsed_t_ms = int((end_t - start_t) * 1000)
-        self._log_info('>>> 获取账户挂单耗时: {} ms'.format(elapsed_t_ms))
-
-        # 每隔固定时间，检查挂单数量合理性
-        self._reasonable_order_num_estimate()
-
-        account_orders_list = [each_info['stg_id'] for each_info in account_open_orders]
-        account_orders_list_id = [str(each_info['server_id']) for each_info in account_open_orders]
-        # 重新更新部分成交挂单信息
-        self.partially_filled_orders = {}
-        for each_info in account_open_orders:
-            if each_info['size'] != each_info['left_qty']:
-                self.partially_filled_orders[each_info['stg_id']] = abs(each_info['left_qty'])
-
-        stg_open_orders: list[str] = [each_order['id'] for each_order in self.open_buy_orders] + [each_order['id'] for each_order in self.open_sell_orders]
-        # 剔除特殊挂单
-        market_ioc_buy, market_ioc_sell = self.gen_id(self.MARKET_ORDER_ID, self.BUY), self.gen_id(self.MARKET_ORDER_ID, self.SELL)
-        for each_i, each_stg_id in enumerate(account_orders_list):
-            if market_ioc_buy == each_stg_id:
-                account_orders_list.pop(each_i)
-                account_orders_list_id.pop(each_i)
-            elif market_ioc_sell == each_stg_id:
-                account_orders_list.pop(each_i)
-                account_orders_list_id.pop(each_i)
-
-        if len(account_orders_list) == len(stg_open_orders):
-            self._log_info('$$$ 快速判断无需修正挂单')
-            self._need_fix_order = False
-            return
-
-        # 勤快方法
-        exist_redundant_order, exist_missing_order = False, False
-        for each_index, each_account_order_id in enumerate(account_orders_list):
-            if each_account_order_id not in stg_open_orders:
-                real_id = account_orders_list_id[each_index]
-                self._log_info('$$$ 检测到多余挂单，撤销挂单\t\tid: {:<12}\tid: {:<10}'.format(real_id, each_account_order_id))
-                exist_redundant_order = True
-
-                cancel_cmd = Token.ORDER_INFO.copy()
-                cancel_cmd['symbol'] = self.symbol_name
-                cancel_cmd['id'] = real_id
-                asyncio.create_task(self.command_transmitter(trans_command=cancel_cmd, token=Token.TO_CANCEL))
-
-        for each_stg_order_id in stg_open_orders:
-            if each_stg_order_id not in account_orders_list:
-                self._log_info('$$$ 检测到缺失挂单，补充挂单\t\t\tid: {:<10}'.format(each_stg_order_id))
-                exist_missing_order = True
-                index, side = self.parse_id(each_stg_order_id)
-
-                posting_order = Token.ORDER_INFO.copy()
-                posting_order['symbol'] = self.symbol_name
-                posting_order['id'] = each_stg_order_id
-                posting_order['price'] = self.all_grid_price[index]
-                posting_order['side'] = self.parse_id(each_stg_order_id)[1]
-                posting_order['quantity'] = self.all_grid_quantity[index + 1] if side == self.BUY else self.all_grid_quantity[index]
-                asyncio.create_task(self.command_transmitter(trans_command=posting_order, token=Token.TO_POST_POC))
-
-        if exist_redundant_order or exist_missing_order:
-            self._log_info('$$$ 修正挂单任务完成')
-        else:
-            self._log_info('$$$ 所有挂单正常，无需修正挂单')
-
-        self._need_fix_order = False
-
-    async def _order_fixer(self, first_waiting_time: int = 300, interval_time: int = 1200) -> None:
-        """
-        该协程是一个一直循环运行的任务，每等待一段时间，执行修正挂单任务
-        :return:
-        """
-        self._log_info('$$$ 挂单卫士已开启')
-        await asyncio.sleep(first_waiting_time)
-
-        while True:
-            self._log_info('$$$ 挂单卫士: 例行修正挂单')
-            if self._need_fix_order:
-                self._log_info('$$$ 挂单卫士: 已有挂单修正任务，不干扰')
-            else:
-                self._need_fix_order = True
-            await asyncio.sleep(interval_time)
-
-    async def _dealing_partial_order(self, order_data_dict: dict) -> bool:
-        """
-        用于处理部分成交的订单，操作：
-        如果该订单已被记录，则根据交易量判断订单是否全部完成，已完成则删除记录，未完成则更新信息
-        如果未被记录，则增添记录
-        并更新统计信息
-        :param order_data_dict: 部分成交订单的订单信息
-        :return: True, 订单已全部完成，交给处理。False, 订单未全部完成，继续等待，不操作
-        """
-        fully_fulfilled = False
-
-        partial_order_id = order_data_dict['id']
-        order_index, order_side = self.parse_id(partial_order_id)
-        filled_qty = int(abs(order_data_dict['quantity']))
-        filled_price: float = float(order_data_dict['price'])
-        # 更新统计信息，此处信息最准确
-        adding_volume = calc(calc(filled_qty, self.symbol_quantity_min_step, '*'), filled_price, '*')
-        self._trading_statistics['achieved_trade_volume'] = calc(self._trading_statistics['achieved_trade_volume'], adding_volume, '+')
-        self._trading_statistics['total_trading_fees'] = calc(self._trading_statistics['total_trading_fees'], calc(adding_volume, self.symbol_maker_fee, '*'), '+')
-
-        if order_side == self.BUY:
-            self._account_position_theory += filled_qty
-        elif order_side == self.SELL:
-            self._account_position_theory -= filled_qty
-        else:
-            raise ValueError('parsed unknown side info!')
-
-        if partial_order_id in self.partially_filled_orders.keys():
-
-            ini_left_qty = self.partially_filled_orders[partial_order_id]
-
-            left_qty = ini_left_qty - filled_qty
-            if left_qty > 0:
-                self.partially_filled_orders[partial_order_id] = left_qty
-                self._log_info('订单再次部分成交!\t\t价格: {:<12}\tid: {:<10}'.format(order_data_dict['price'], partial_order_id))
-                self._log_info('剩余 {} 张'.format(left_qty))
-            elif left_qty == 0:
-                # 订单已完成
-                self.partially_filled_orders.pop(partial_order_id)
-
-                fully_fulfilled = True
-            else:
-                self._log_info('error: left qty < 0, plz check code!')
-                self._log_info('{} : {} = {} - {}'.format(partial_order_id, left_qty, ini_left_qty, filled_qty))
-                # 在极高频的情况下，有可能会出现这种情况，比如adjusting order 维护不到位导致普通挂单数量不正常，此时也剔除该记录
-                self.partially_filled_orders.pop(partial_order_id)
-
-        else:
-            left_qty = self.all_grid_quantity[order_index + 1] - filled_qty if order_side == self.BUY else self.all_grid_quantity[order_index] - filled_qty
-            if left_qty < 0:
-                self._log_info('error: got a normal order but traded quantity abnormal !')
-                self._log_info('order: {}, filled qty: {}'.format(partial_order_id, filled_qty))
-                return False
-            self.partially_filled_orders[partial_order_id] = left_qty
-
-            self._log_info('\n订单部分成交!!\t\t价格: {:<12}\tid: {:<10}'.format(order_data_dict['price'], partial_order_id))
-            self._log_info('剩余 {} 张'.format(left_qty))
-
-        return fully_fulfilled
-
-    def _cancel_partial_order_check(self, order_id: str) -> None:
-        """
-        每次撤销挂单时，调用此函数，以修正部分成交挂单带来的仓位影响
-        操作：判断该挂单是否记录为部分成交挂单，根据挂单方向和订单原数量修正仓位
-        :return:
-        """
-        if order_id in self.partially_filled_orders.keys():
-            order_index, order_side = self.parse_id(order_id)
-            if order_side == self.BUY:
-                traded_qty = self.all_grid_quantity[order_index + 1] - self.partially_filled_orders[order_id]
-                self._accumulated_pos_deviation -= traded_qty
-            elif order_side == self.SELL:
-                traded_qty = self.all_grid_quantity[order_index] - self.partially_filled_orders[order_id]
-                self._accumulated_pos_deviation += traded_qty
-            self.partially_filled_orders.pop(order_id)
+        pass
 
     async def _dealing_ENTRY_ORDER(self, order_data_dict: dict) -> None:
         """
@@ -2249,280 +1767,14 @@ class SmartGridAnalyzerFutures(Analyzer):
         else:
             self._log_info('error: actual filled market qty over target qty, plz check code and trade status!')
 
-    async def _dealing_adjusting_order(self, order_data_dict: dict) -> bool:
-        """
-        处理修正仓位的特殊挂单，保存剩余仓位修正数量
-        :param order_data_dict:
-        :return:
-        """
-        order_fully_fulfilled = False
-
-        filled_qty: int = abs(order_data_dict['quantity'])
-        filled_price: float = float(order_data_dict['price'])
-        # 更新统计信息，此处信息最准确
-        adding_volume = calc(calc(filled_qty, self.symbol_quantity_min_step, '*'), filled_price, '*')
-        self._trading_statistics['achieved_trade_volume'] = calc(self._trading_statistics['achieved_trade_volume'], adding_volume, '+')
-        self._trading_statistics['total_trading_fees'] = calc(self._trading_statistics['total_trading_fees'], calc(adding_volume, self.symbol_maker_fee, '*'), '+')
-
-        self._adjusting_qty_left = self._adjusting_qty_left - filled_qty
-
-        if self._adjusting_order_side == self.BUY:
-            self._account_position_theory += filled_qty
-        else:
-            self._account_position_theory -= filled_qty
-
-        if self._adjusting_qty_left == 0:
-            # 结束仓位修正并维护网格
-            self._log_info('\n### 修正挂单完全成交，仓位修正完成!!! ###\n')
-
-            self.adjusting_index = self._pre_adjusting_index = -1
-            self._adjusting_qty_target = self._adjusting_qty_left = 0
-            self._need_adjust_pos = False
-            order_fully_fulfilled = True
-
-        elif self._adjusting_qty_left < 0:
-            self._log_info('\n ##### 修正挂单统计有误! 剩余数量小于零')
-            self._log_info('\n ##### this_qty: {}\ttarget: {}\tleft: {}'.format(filled_qty, self._adjusting_qty_target, self._adjusting_qty_left))
-
-            # todo 暂且也如此，摆烂
-            self.adjusting_index = self._pre_adjusting_index = -1
-            self._adjusting_qty_target = self._adjusting_qty_left = 0
-            self._need_adjust_pos = False
-            order_fully_fulfilled = True
-
-        else:
-            # 仓位修正未完成
-            self._log_info('### 修正挂单部分成交')
-            self._log_info('### target: {}, left: {}'.format(self._adjusting_qty_target, self._adjusting_qty_left))
-            self._log_info('### 修正进度:\t已完成/总数\t{}/{}'.format(str(self._adjusting_qty_target - self._adjusting_qty_left), self._adjusting_qty_target))
-
-        return order_fully_fulfilled
-
     def _reset_functional_vars(self) -> None:
-        """
-        重置所有特殊功能相关变量
-        :return:
-        """
-        # 挂单处理相关
-        self._need_fix_order = False
-        self.partially_filled_orders: dict[str, int] = {}
-        self._cannot_check_open_orders = False
-
-        # 仓位矫正相关
-        self.adjusting_index = self._pre_adjusting_index = -1
-        self._adjusting_qty_target = self._adjusting_qty_left = 0
-        self._need_adjust_pos = False
-        self._pre_save_acc_pos_dev = 0
-
         # 市价单
         self._MARKET_ORDER_qty_target = self._MARKET_ORDER_qty_left = 0
         self._MARKET_ORDER_value = 0
 
-    def _additional_action(self) -> None:
-        """
-        触发器，用于启动coroutine
-        :return:
-        """
-        asyncio.create_task(self._additional_action_task())
-
-    async def _additional_action_task(self) -> None:
-        """
-        此时市场交易不剧烈，策略可以做出额外的操作，
-        该方法属于半主动式策略
-        功能：
-            1. 如果需要修正挂单，则修正挂单
-
-            2.1 如果存在特殊挂单，则判断特殊挂单是否离市价较近
-            2.2 如果不存在特殊挂单，判断是否需要修正仓位，
-
-        操作：
-            1. 首先修正维护策略挂单
-            2. 处理部分成交的挂单，偏离太远的纳入仓位偏移统计
-            3. 处理仓位修正挂单
-
-        注意：存在特殊挂单时，如果accumulated dev 因为其他原因又不为0，系统会等待adjusting order完成后，继续创建新的 adjusting order
-        :return:
-        """
-        self._log_info('>>> ')
-        if not self._is_trading:  # 因为此时有可能人工手动停止
-            return
-        if self._doing_delay_task:
-            self._log_info('\n>>> 上锁，不重复开启延时任务')
-            return
-        self._doing_delay_task = True
-
-        # 使用 try 模块避免可能的问题
-        try:
-            if self._need_fix_order:
-                self._log_info('\n>>> switch: 检查当前挂单')
-                await self._check_open_orders()  # 消耗约 100 ms
-                # todo: 可以考虑分开写，使用两个延时器
-                return
-
-            if self.adjusting_index == -1:
-                # 此时没有特殊挂单
-                if self._need_adjust_pos:
-                    self._log_info('\n>>> 需要修正仓位')
-                    await self._check_position()  # 消耗约 100 ms
-
-                    if self._accumulated_pos_deviation == 0:
-                        self._log_info('### 账户实际仓位正确，不需要修正\n')
-                        self._need_adjust_pos = False
-                    else:
-                        if self._accumulated_pos_deviation > 0:
-                            # 需要增加买 1 挂单数量以修正仓位
-
-                            if len(self.open_buy_orders) == 0:
-                                # 由于该策略一般不会出现缺少卖挂单的情况，因此不判断卖挂单
-                                self._log_info('### 当前无买挂单用于修正仓位')
-                                if self.current_symbol_price <= self.present_bottom_price:
-                                    self._log_info('### 价格低于下区间，市价修正仓位')
-                                    asyncio.create_task(self._post_market_order(self.BUY, self._accumulated_pos_deviation))
-                                    self._accumulated_pos_deviation = 0
-                                else:
-                                    self._log_info('### 等待下一回合修正')
-
-                            else:
-                                self._log_info('### 修正买1单')  # todo: test print to delete, 该输出过于频繁
-                                adjusting_id = self.open_buy_orders[-1]['id']  # 买 1 订单
-                                self.adjusting_index = self.parse_id(adjusting_id)[0]
-                                self._adjusting_order_side = self.BUY
-                                if adjusting_id in self.partially_filled_orders.keys():
-                                    self._log_info('### 罕见: 部分成交挂单作为仓位修正挂单')
-                                    self._adjusting_qty_target = self._adjusting_qty_left = int(self.partially_filled_orders[adjusting_id]) + int(self._accumulated_pos_deviation)
-                                    self._log_info('\n>>> 设定修正买单数量 {} 张, id: {}'.format(self._adjusting_qty_target, adjusting_id))
-                                    # 此后该部分成交挂单就交给特殊仓位修正挂单功能处理
-                                    self.partially_filled_orders.pop(adjusting_id)
-                                else:
-                                    self._adjusting_qty_target = self._adjusting_qty_left = self.all_grid_quantity[self.adjusting_index + 1] + int(self._accumulated_pos_deviation)
-                                    self._log_info('\n>>> 设定修正买单数量 {} 张, id: {}'.format(self._adjusting_qty_target, adjusting_id))
-
-                                adjusting_order = Token.ORDER_INFO.copy()
-                                adjusting_order['symbol'] = self.symbol_name
-                                adjusting_order['id'] = self.open_buy_orders[-1]['id']
-                                adjusting_order['quantity'] = self._adjusting_qty_target
-                                # 规零相关统计数据
-                                self._pre_save_acc_pos_dev = self._accumulated_pos_deviation
-                                self._accumulated_pos_deviation = 0
-                                asyncio.create_task(self.command_transmitter(trans_command=adjusting_order, token=Token.AMEND_POC_QTY))
-                        else:
-                            # 需要增加卖 1 挂单数量以修正仓位
-                            if len(self.open_sell_orders) == 0:
-                                self._log_info('### 当前无卖挂单，等待下一回合')
-                                # 由于修正卖挂单的情况是仓位比预期大，因此等到高位再卖出，价格跌破区间时等待挂单
-                                return
-
-                            self._log_info('### 修正卖1单')  # todo: test print to delete, 该输出过于频繁
-                            adjusting_id = self.open_sell_orders[0]['id']  # 卖 1 订单
-                            self.adjusting_index = self.parse_id(adjusting_id)[0]
-                            self._adjusting_order_side = self.SELL
-                            if adjusting_id in self.partially_filled_orders.keys():
-                                self._log_info('### 罕见: 部分成交挂单作为仓位修正挂单')
-                                self._adjusting_qty_target = self._adjusting_qty_left = int(self.partially_filled_orders[adjusting_id]) + int(abs(self._accumulated_pos_deviation))
-                                self._log_info('\n>>> 设定修正卖单数量 {} 张, id: {}'.format(self._adjusting_qty_target, adjusting_id))
-                                # 此后该部分成交挂单就交给特殊仓位修正挂单功能处理
-                                self.partially_filled_orders.pop(adjusting_id)
-                                # self.partially_orders_indices_list.remove(self.adjusting_index)
-                            else:
-                                self._adjusting_qty_target = self._adjusting_qty_left = self.all_grid_quantity[self.adjusting_index] + int(abs(self._accumulated_pos_deviation))
-                                self._log_info('\n>>> 设定修正卖单数量 {} 张, id: {}'.format(self._adjusting_qty_target, adjusting_id))
-
-                            adjusting_order = Token.ORDER_INFO.copy()
-                            adjusting_order['symbol'] = self.symbol_name
-                            adjusting_order['id'] = self.open_sell_orders[0]['id']
-                            adjusting_order['quantity'] = -self._adjusting_qty_target
-                            # 注意修改订单数量比较特殊，需要提供带符号的数量
-                            self._pre_save_acc_pos_dev = self._accumulated_pos_deviation
-                            self._accumulated_pos_deviation = 0
-                            asyncio.create_task(self.command_transmitter(trans_command=adjusting_order, token=Token.AMEND_POC_QTY))
-
-                else:
-                    # status all good
-                    # self._log_info('\n>>> 仓位状态正常')
-                    pass
-
-            else:
-                self._log_info('\n>>> 检查调仓挂单')
-                if abs(self.critical_index - self.adjusting_index) > min(10, self.min_buy_order_num, self.min_sell_order_num):  # todo: 测试市场，偏离10是否合理
-                    self._log_info('### 修正挂单距离遥远，二次修正，请注意套利收益!')
-                    if self.adjusting_index < self.critical_index:
-                        self._log_info('### 再次修正买1单')
-                        # 操作：将原有的adjusting index挂单撤销并重新挂网格单，然后修改现有买1单数量
-                        if len(self.open_buy_orders) == 0:
-                            self._log_info('### 无买单，取消修正')
-                            return
-                        self._pre_adjusting_index = self.adjusting_index
-
-                        cancel_cmd = Token.ORDER_INFO.copy()
-                        cancel_cmd['symbol'] = self.symbol_name
-                        cancel_cmd['id'] = self.gen_id(self.adjusting_index, self.BUY)
-
-                        asyncio.create_task(self.command_transmitter(trans_command=cancel_cmd, token=Token.TO_CANCEL))
-
-                        re_adjusting_id = self.open_buy_orders[-1]['id']
-                        self.adjusting_index = self.parse_id(re_adjusting_id)[0]
-
-                        self._log_info('\n>>> 再次修正，设定修正买单数量 {} 张, id: {}'.format(self._adjusting_qty_left, re_adjusting_id))
-
-                        adjust_order = Token.ORDER_INFO.copy()
-                        adjust_order['symbol'] = self.symbol_name
-                        adjust_order['id'] = self.open_buy_orders[-1]['id']
-                        adjust_order['quantity'] = self._adjusting_qty_left
-
-                        asyncio.create_task(self.command_transmitter(trans_command=adjust_order, token=Token.AMEND_POC_QTY))
-                        # 撤销挂单以后，等待300ms再贴新挂单，策略提供了该时间空余
-                        time.sleep(0.3)
-                        repair_order = Token.ORDER_INFO.copy()
-                        repair_order['symbol'] = self.symbol_name
-                        repair_order['id'] = self.gen_id(self._pre_adjusting_index, self.BUY)
-                        repair_order['price'] = self.all_grid_price[self._pre_adjusting_index]
-                        repair_order['side'] = self.BUY
-                        repair_order['quantity'] = self.all_grid_quantity[self._pre_adjusting_index + 1]
-
-                        asyncio.create_task(self.command_transmitter(trans_command=repair_order, token=Token.TO_POST_POC))
-                    else:
-                        self._log_info('### 再次修正卖1单')
-                        if len(self.open_buy_orders) == 0:
-                            self._log_info('### 无卖单，取消修正')
-                            return
-                        self._pre_adjusting_index = self.adjusting_index
-                        cancel_cmd = Token.ORDER_INFO.copy()
-                        cancel_cmd['symbol'] = self.symbol_name
-                        cancel_cmd['id'] = self.gen_id(self.adjusting_index, self.SELL)
-
-                        asyncio.create_task(self.command_transmitter(trans_command=cancel_cmd, token=Token.TO_CANCEL))
-
-                        re_adjusting_id = self.open_sell_orders[0]['id']
-                        self.adjusting_index = self.parse_id(re_adjusting_id)[0]
-
-                        self._log_info('\n>>> 再次修正，设定修正卖单数量 {} 张, id: {}'.format(self._adjusting_qty_left, re_adjusting_id))
-
-                        adjust_order = Token.ORDER_INFO.copy()
-                        adjust_order['symbol'] = self.symbol_name
-                        adjust_order['id'] = self.open_sell_orders[0]['id']
-                        adjust_order['quantity'] = -self._adjusting_qty_left
-
-                        asyncio.create_task(self.command_transmitter(trans_command=adjust_order, token=Token.AMEND_POC_QTY))
-
-                        time.sleep(0.3)
-                        repair_order = Token.ORDER_INFO.copy()
-                        repair_order['symbol'] = self.symbol_name
-                        repair_order['id'] = self.gen_id(self._pre_adjusting_index, self.SELL)
-                        repair_order['price'] = self.all_grid_price[self._pre_adjusting_index]
-                        repair_order['side'] = self.SELL
-                        repair_order['quantity'] = self.all_grid_quantity[self._pre_adjusting_index]
-
-                        asyncio.create_task(self.command_transmitter(trans_command=repair_order, token=Token.TO_POST_POC))
-                else:
-                    # adjusting order status okay
-                    self._log_info('\n>>> 调仓挂单状态正常，距离 {}'.format(abs(self.critical_index - self.adjusting_index)))
-                    pass
-
-        finally:
-            self._doing_delay_task = False
-
     # interaction methods
-    async def report_receiver(self, recv_data_dict: dict, append_info: str = None) -> None:
+    # noinspection PyMethodOverriding
+    async def report_receiver(self, recv_data_dict: dict, acc_num: int, append_info: str = None) -> None:
 
         # 由于更新订单通道，现在部分成交将会被拆分收到信息
         if recv_data_dict['status'] == Token.ORDER_FILLED:
@@ -2535,88 +1787,46 @@ class SmartGridAnalyzerFutures(Analyzer):
             elif order_index == self.MARKET_ORDER_ID:
                 await self._dealing_MARKET_ORDER(recv_data_dict)
 
-            elif order_index == self.adjusting_index:
-                # 高频关键功能：仓位修复策略
-                order_fulfilled = await self._dealing_adjusting_order(recv_data_dict)
-                if order_fulfilled:
-                    # 更新订单成交数统计
-                    if order_side == self.BUY:
-                        self._all_grid_buy_num[order_index] += 1
-                        self._trading_statistics['filled_buy_order_num'] += 1
-                    else:
-                        self._all_grid_sell_num[order_index] += 1
-                        self._trading_statistics['filled_sell_order_num'] += 1
-                    await self._maintainer_by_index(order_index)
-                    await self._maintain_grid_order(order_index, order_side, recv_data_dict['id'], append_info, order_filled=True)
-
             else:
                 # 其他普通订单，维护网格。判断成交数量是否为原始网格数量，如果是，则直接维护网格，如果不是，则先判断部分成交再维护网格
                 order_qty: int = abs(recv_data_dict['quantity'])  # 这一部分相当于 dealing normal fulfilled order
-                order_fully_fulfilled = False
                 if order_side == self.BUY:
-                    if order_qty == self.all_grid_quantity[order_index + 1]:
-                        order_fully_fulfilled = True
-                        self._account_position_theory += order_qty
-                        # 更新订单成交数统计，交易量和手续费
-                        self._all_grid_buy_num[order_index] += 1
-                        self._trading_statistics['filled_buy_order_num'] += 1
-                        add_volume = calc(calc(self.all_grid_quantity[order_index + 1], self.symbol_quantity_min_step, '*'), self.all_grid_price[order_index], '*')
-                        self._trading_statistics['achieved_trade_volume'] = calc(self._trading_statistics['achieved_trade_volume'], add_volume, '+')
-                        self._trading_statistics['total_trading_fees'] = calc(self._trading_statistics['total_trading_fees'], calc(add_volume, self.symbol_maker_fee, '*'), '+')
+                    self._account_position_theory += order_qty
+                    # 更新订单成交数统计，交易量和手续费
+                    self._all_grid_buy_num[order_index] += 1
+                    self._trading_statistics['filled_buy_order_num'] += 1
+                    add_volume = calc(calc(self.all_grid_quantity[order_index + 1], self.symbol_quantity_min_step, '*'), self.all_grid_price[order_index], '*')
+                    self._trading_statistics['achieved_trade_volume'] = calc(self._trading_statistics['achieved_trade_volume'], add_volume, '+')
+                    self._trading_statistics['total_trading_fees'] = calc(self._trading_statistics['total_trading_fees'], calc(add_volume, self.symbol_maker_fee, '*'), '+')
 
                 else:
-                    if order_qty == self.all_grid_quantity[order_index]:
-                        order_fully_fulfilled = True
-                        self._account_position_theory -= order_qty
+                    self._account_position_theory -= order_qty
+                    self._all_grid_sell_num[order_index] += 1
+                    self._trading_statistics['filled_sell_order_num'] += 1
+                    add_volume = calc(calc(self.all_grid_quantity[order_index], self.symbol_quantity_min_step, '*'), self.all_grid_price[order_index], '*')
+                    self._trading_statistics['achieved_trade_volume'] = calc(self._trading_statistics['achieved_trade_volume'], add_volume, '+')
+                    self._trading_statistics['total_trading_fees'] = calc(self._trading_statistics['total_trading_fees'], calc(add_volume, self.symbol_maker_fee, '*'), '+')
 
-                        self._all_grid_sell_num[order_index] += 1
-                        self._trading_statistics['filled_sell_order_num'] += 1
-                        add_volume = calc(calc(self.all_grid_quantity[order_index], self.symbol_quantity_min_step, '*'), self.all_grid_price[order_index], '*')
-                        self._trading_statistics['achieved_trade_volume'] = calc(self._trading_statistics['achieved_trade_volume'], add_volume, '+')
-                        self._trading_statistics['total_trading_fees'] = calc(self._trading_statistics['total_trading_fees'], calc(add_volume, self.symbol_maker_fee, '*'), '+')
-
-                # 如果订单完全成交，直接维护网格。如果部分成交，额外判断逻辑
-                if order_fully_fulfilled:
-                    await self._maintainer_by_index(order_index)
-                    await self._maintain_grid_order(order_index, order_side, recv_data_dict['id'], append_info, order_filled=True)
-                else:
-                    order_fulfilled = await self._dealing_partial_order(recv_data_dict)
-                    if order_fulfilled:
-                        # 更新订单成交数统计
-                        if order_side == self.BUY:
-                            self._all_grid_buy_num[order_index] += 1
-                            self._trading_statistics['filled_buy_order_num'] += 1
-                        else:
-                            self._all_grid_sell_num[order_index] += 1
-                            self._trading_statistics['filled_sell_order_num'] += 1
-                        await self._maintainer_by_index(order_index)
-                        await self._maintain_grid_order(order_index, order_side, recv_data_dict['id'], append_info, order_filled=True)
+                await self._maintainer_by_index(order_index)
+                await self._maintain_grid_order(order_index, order_side, recv_data_dict['id'], append_info, order_filled=True)
 
         elif recv_data_dict['status'] == Token.POST_SUCCESS:
-            self._log_info('收到挂单成功信息\t\t价格: {:<12}\tid: {:<10}'.format(str(float(recv_data_dict['price'])), recv_data_dict['id']))
+            self._log_info('账户{} 收到挂单成功信息\t\t价格: {:<12}\tid: {:<10}'.format(acc_num, str(float(recv_data_dict['price'])), recv_data_dict['id']))
 
         elif recv_data_dict['status'] == Token.POC_SUCCESS:
-            self._log_info('收到poc挂单成功信息\t\t价格: {:<12}\tid: {:<10}'.format(str(float(recv_data_dict['price'])), recv_data_dict['id']))
+            self._log_info('账户{} 收到poc挂单成功信息\t\t价格: {:<12}\tid: {:<10}'.format(acc_num, str(float(recv_data_dict['price'])), recv_data_dict['id']))
 
         elif recv_data_dict['status'] == Token.CANCEL_SUCCESS:
             self._log_info('收到撤单成功信息\t\t\t\tid: {:<10}'.format(recv_data_dict['id']))
 
         elif recv_data_dict['status'] == Token.CANCEL_POC_SUCCESS:
-            self._log_info('收到poc撤单成功信息\t\t\t\tid: {:<10}'.format(recv_data_dict['id']))
+            self._log_info('账户{} 收到poc撤单成功信息\t\t\t\tid: {:<10}'.format(acc_num, recv_data_dict['id']))
 
         elif recv_data_dict['status'] == Token.PARTIALLY_FILLED:
             self._log_info('\nerror: invalid info received, plz check code\n')
 
         elif recv_data_dict['status'] == Token.ORDER_UPDATE:  # 对于gate服务器，该收信有可能是订单部分成交或订单修改成功
-            # 目前在该策略逻辑中，只有一种更新订单的情况即修改买1 卖1 订单的数量，其他的id都是部分成交，已由其他通道处理
-            if self.adjusting_index == -1:
-                pass
-            else:
-                order_index, order_side = self.parse_id(recv_data_dict['id'])
-                if order_index == self.adjusting_index:
-                    self._log_info(('调仓订单修改成功~\t\t价格: {:<12}\tid: {:<10}'.format(str(float(recv_data_dict['price'])), recv_data_dict['id'])))
-                else:
-                    pass
+            raise ValueError('暂未处理仓位修正功能，不会出现该情况')
 
         elif recv_data_dict['status'] == Token.UNIDENTIFIED:
             pass
@@ -2627,42 +1837,23 @@ class SmartGridAnalyzerFutures(Analyzer):
             self._log_info('失败信息: {}'.format(append_info))
 
         elif recv_data_dict['status'] == Token.POC_FAILED:
-            self._log_info('\npoc挂单失败!!!\t\t价格: {:<12}\tid: {:<10}'.format(recv_data_dict['price'], recv_data_dict['id']))
+            self._log_info('\n账户{} poc挂单失败!!!\t\t价格: {:<12}\tid: {:<10}'.format(acc_num, recv_data_dict['price'], recv_data_dict['id']))
             self._log_info('失败信息: {}'.format(append_info))
 
         elif recv_data_dict['status'] == Token.POC_REJECTED:
-            self._log_info('\npoc挂单失败，价格错位\t\t系统时间 {}'.format(str(pd.to_datetime(self.gen_timestamp(), unit='ms') + pd.Timedelta(hours=8))))
+            self._log_info('\n账户{} poc挂单失败，价格错位\t\t系统时间 {}'.format(acc_num, str(pd.to_datetime(self.gen_timestamp(), unit='ms') + pd.Timedelta(hours=8))))
             this_order_index, side = self.parse_id(recv_data_dict['id'])
-            if side == self.BUY:
-                self._accumulated_pos_deviation += self.all_grid_quantity[this_order_index + 1]
-            else:
-                self._accumulated_pos_deviation -= self.all_grid_quantity[this_order_index]
+
             await self._maintainer_by_index(this_order_index)
             await self._maintain_grid_order(this_order_index, side, recv_data_dict['id'], append_info, order_filled=False)
 
         elif recv_data_dict['status'] == Token.CANCEL_FAILED:
-            self._log_info('\n撤销挂单失败!!!\t\t价格: {:<12}\tid: {:<10}'.format(recv_data_dict['price'], recv_data_dict['id']))
+            self._log_info('\n账户{} 撤销挂单失败!!!\t\t价格: {:<12}\tid: {:<10}'.format(acc_num, recv_data_dict['price'], recv_data_dict['id']))
             if append_info:
                 self._log_info(append_info)
 
         elif recv_data_dict['status'] == Token.AMEND_POC_FAILED:
-            if self.adjusting_index != -1:
-                # todo: 此处失败原因：修改盘口挂单时，刚刚发送挂单请求，或者刚刚挂单成交，立马尝试修正
-                if self._pre_adjusting_index == -1:
-                    # 第一次修正挂单
-                    self._log_info('\n##### 添加修正挂单失败 ##### 失败信息:')
-                    self._log_info(append_info)
-                    self._log_info('c index: {}\t a index: {}'.format(self.critical_index, self.adjusting_index))
-                    self.adjusting_index = -1
-                    # 使用加号，防止在请求期间存在其他的仓位偏移来源
-                    self._accumulated_pos_deviation += self._pre_save_acc_pos_dev
-                else:
-                    self._log_info('\n##### 修改修正仓位挂单失败 ##### 失败信息:')
-                    self._log_info(append_info)
-                    self._log_info('c index: {}\t a index: {}\tpre a index: {}'.format(self.critical_index, self.adjusting_index, self._pre_adjusting_index))
-                    # todo: 暂时先摆烂，尽量通过优化避免这种情况的出现
-                    # self.adjusting_index = self._pre_adjusting_index
-                    self.adjusting_index = self._pre_adjusting_index = -1
+            raise ValueError('暂未处理仓位修正功能，不会出现该情况2')
 
         elif recv_data_dict['status'] == Token.TEMP_TOKEN:
             pass
@@ -2678,7 +1869,7 @@ class SmartGridAnalyzerFutures(Analyzer):
             command_dict['side'] = trans_command['side']
             command_dict['quantity'] = trans_command['quantity']
             command_dict['status'] = token
-            asyncio.create_task(self._my_executor.command_receiver(command_dict))
+            asyncio.create_task(self._my_operator.command_receiver(command_dict))
         elif token == Token.TO_POST_POC:
             # todo: 需要将所有统一起来，目前只有此处修改，需要全局更改
             command_dict['id'] = trans_command['id']
@@ -2686,41 +1877,43 @@ class SmartGridAnalyzerFutures(Analyzer):
             command_dict['side'] = trans_command['side']
             command_dict['quantity'] = trans_command['quantity']
             command_dict['status'] = token
-            asyncio.create_task(self._my_executor.command_receiver(command_dict))
+            asyncio.create_task(self._my_operator.command_receiver(command_dict))
         elif token == Token.TO_CANCEL:
             command_dict['id'] = trans_command['id']
             command_dict['status'] = token
-            asyncio.create_task(self._my_executor.command_receiver(command_dict))
+            asyncio.create_task(self._my_operator.command_receiver(command_dict))
         elif token == Token.TO_POST_BATCH:
-            asyncio.create_task(self._my_executor.command_receiver(trans_command))
+            asyncio.create_task(self._my_operator.command_receiver(trans_command))
         elif token == Token.TO_POST_BATCH_POC:
-            asyncio.create_task(self._my_executor.command_receiver(trans_command))
+            # print('总领需要批量挂单')
+            asyncio.create_task(self._my_operator.command_receiver(trans_command))
         elif token == Token.TO_POST_MARKET:
+            # print('总领需要市价挂单')
             command_dict['side'] = trans_command['side']
             command_dict['id'] = self.gen_id(self.MARKET_ORDER_ID, trans_command['side'])
             command_dict['quantity'] = trans_command['quantity']
             command_dict['status'] = token
-            asyncio.create_task(self._my_executor.command_receiver(command_dict))
+            asyncio.create_task(self._my_operator.command_receiver(command_dict))
         elif token == Token.AMEND_POC_PRICE:
             command_dict['id'] = trans_command['id']
             command_dict['price'] = trans_command['price']
             command_dict['status'] = token
-            asyncio.create_task(self._my_executor.command_receiver(command_dict))
+            asyncio.create_task(self._my_operator.command_receiver(command_dict))
         elif token == Token.AMEND_POC_QTY:
             command_dict['id'] = trans_command['id']
             command_dict['quantity'] = trans_command['quantity']
             command_dict['status'] = token
-            asyncio.create_task(self._my_executor.command_receiver(command_dict))
+            asyncio.create_task(self._my_operator.command_receiver(command_dict))
         elif token == Token.CANCEL_ALL:
             command_dict['status'] = token
-            asyncio.create_task(self._my_executor.command_receiver(command_dict))
+            asyncio.create_task(self._my_operator.command_receiver(command_dict))
         elif token == Token.CLOSE_POSITION:
             command_dict['quantity'] = trans_command['quantity']
             command_dict['status'] = token
-            asyncio.create_task(self._my_executor.command_receiver(command_dict))
+            asyncio.create_task(self._my_operator.command_receiver(command_dict))
         elif token == Token.TEMP_TOKEN:
             command_dict['status'] = token
-            asyncio.create_task(self._my_executor.command_receiver(command_dict))
+            asyncio.create_task(self._my_operator.command_receiver(command_dict))
         elif token is None:
             self._log_info('未定义命令类型，不发送')
         else:
@@ -2744,17 +1937,14 @@ class SmartGridAnalyzerFutures(Analyzer):
         self.current_symbol_price = recv_ticker_data['price']
 
         if self._is_trading:
-            # 策略还在运行时，检查最新价格是否偏离过大，todo: 是否占用过多资源，暂时先这么用
-            if self.all_grid_price[self.present_bottom_index] < self.current_symbol_price < self._x_grid_up_limit:
-                # 新检测方法，价格偏离c index两端网格距离之和的5倍，
-                if 1 <= self.critical_index <= self.max_index - 1:
-                    if abs(calc(self.current_symbol_price, self.all_grid_price[self.critical_index], '-')) > \
-                            5 * calc(self.all_grid_price[self.critical_index + 1], self.all_grid_price[self.critical_index - 1], '-'):
-                        self._log_info('$$$ 检测到价格偏离，未收到挂单成交信息')
-                        self._log_info('$$$ 当前ticker价: {}\t\t网格critical价: {}'.format(self.current_symbol_price, self.all_grid_price[self.critical_index]))
-                        self._need_fix_order = True
+            self.send_index()
 
-            elif self.current_symbol_price > self._x_grid_up_limit:
+            # === 高频缓冲功能 === # 超过某个固定时间仍未收到ticker信息，则此时交易不剧烈，可以做额外操作
+            if self._ticker_delay_timer:
+                self._ticker_delay_timer.cancel()
+            self._ticker_delay_timer = self._running_loop.call_later(self._ticker_delay_trigger_time, self.delay_task)
+
+            if self.current_symbol_price > self._x_grid_up_limit:
                 self._log_info('检测到价格超出上边界!需要终止策略')
                 asyncio.create_task(self._terminate_trading(reason='达到网格上边界'))
 
@@ -2762,19 +1952,27 @@ class SmartGridAnalyzerFutures(Analyzer):
             await self._maintainer_by_price()
 
             # 如果订单成交迅速，ticker收信为 1s，判断也比较频繁
-            if self._accumulated_pos_deviation != 0:
-                self._need_adjust_pos = True
-
-            # === 高频仓位功能 === # 超过某个固定时间仍未收到ticker信息，则此时交易不剧烈，可以做额外操作
-            if self._ticker_delay_timer:
-                self._ticker_delay_timer.cancel()
-            self._ticker_delay_timer = self._running_loop.call_later(self._ticker_delay_trigger_time, self._additional_action)
+            # if self._accumulated_pos_deviation != 0:
+            #     self._need_adjust_pos = True
 
         # if self.developer_switch:
         #     self._reset_functional_vars()
         #     self.developer_switch = False
         #     self._log_info('\n!!! 重置相关任务变量 !!!\n')
         # raise ValueError('test error')
+
+    async def book_ticker_receiver(self, recv_book_ticker: dict) -> None:
+        ask_price = float(recv_book_ticker['a'])
+        bid_price = float(recv_book_ticker['b'])
+        await self._my_operator.send_best_price(ask_price, bid_price)
+
+    def send_index(self):
+        asyncio.create_task(self._my_operator.ticker_sender(self.critical_index, self.present_base_index, self.zero_pos_index, self.present_step_up_index, self.current_symbol_price))
+        # await self._my_operator.ticker_sender(self.critical_index, self.present_base_index, self.zero_pos_index, self.present_step_up_index)
+
+    def delay_task(self):
+        self._log_info('>>> ')
+        asyncio.create_task(self._my_operator.tick_sender())
 
     # tool methods
     def gen_id(self, self_index: int, side: str) -> str:
@@ -2833,6 +2031,37 @@ class SmartGridAnalyzerFutures(Analyzer):
         # 防止太密的价格导致网格价格重复
         return sorted(set(all_price))
 
+    @staticmethod
+    def arithmetic_grid_calc(base_price: float, step_price: float, boundary_price: float) -> list[float]:
+        all_price = []
+        n_count = 0  # 保险，防止死循环
+        if boundary_price > base_price:
+            # 计算上方网格价格
+            while True:
+                each_grid_price = calc(base_price, calc(n_count, step_price, '*'), '+')
+                if each_grid_price <= boundary_price:
+                    all_price.append(each_grid_price)
+                else:
+                    break
+                n_count += 1
+                if n_count >= 99999999:
+                    raise ValueError('计算上方网格价格迭代次数过多!')
+                    break
+        elif boundary_price < base_price:
+            # 计算下方网格价格
+            while True:
+                each_grid_price = calc(base_price, calc(n_count, step_price, '*'), '-')
+                if each_grid_price >= boundary_price:
+                    all_price.insert(0, each_grid_price)
+                else:
+                    break
+                n_count += 1
+                if n_count >= 99999999:
+                    raise ValueError('计算下方网格价格迭代次数过多!')
+                    break
+
+        return all_price
+
     def unequal_grid_qty_calc(self, base_price: float, grid_num: int, fund: float) -> list[int]:
         """
         根据资金平均分配原则，将网格数量平均分配到每个网格
@@ -2856,39 +2085,16 @@ class SmartGridAnalyzerFutures(Analyzer):
 
         return quantities
 
-    @staticmethod
-    def unmatched_profit_calc_past(initial_index: int, current_index: int, all_prices: tuple[float | int], each_grid_qty: float,
-                                   init_pos_price: float, init_pos_qty: float, current_price: float) -> float:
-        """
-        新式便携计算器，可以计算超出区间的网格未配对盈亏
-        该方法也能够用于计算非线性网格!
-        :param initial_index: 初始的index
-        :param current_index: 网格当前的index
-        :param all_prices: 网格所有价格
-        :param each_grid_qty: 每格数量，真实数量
-        :param init_pos_price: 初始仓位价格
-        :param init_pos_qty: 初始仓位数量，真实绝对数量，大于0代表买多，小于0做空
-        :param current_price: 当前最新价格
-        :return: 返回盈亏 和 平均持仓价格
-        """
-        if initial_index == -1:
-            initial_index = len(all_prices) - 1
-        if current_index == -1:
-            current_index = len(all_prices) - 1
-
-        # 第一部分考虑无网格时的持仓盈亏
-        part_1 = calc(calc(current_price, init_pos_price, '-'), init_pos_qty, '*')
-        if current_index > initial_index + 1:
-            price_slice = all_prices[initial_index + 1:current_index]
-        elif current_index < initial_index - 1:
-            price_slice = all_prices[current_index + 1:initial_index]
+    def grid_qty_calc(self, base_price: float, grid_num: int, fund: float) -> int:
+        # 返回数量相等的网格
+        total_qty = int(calc(fund, calc(base_price, self.symbol_quantity_min_step, '*'), '/'))
+        each_qty = int(total_qty / grid_num)
+        if each_qty <= 0:
+            # raise ValueError('每格挂单数量小于等于0')
+            print('每格挂单数量小于等于0')
+            return 1
         else:
-            price_slice = []
-
-        # 第二部分计算网格持仓盈亏
-        part_2 = calc(-abs(calc(calc_sum(price_slice), calc(len(price_slice), current_price, '*'), '-')), each_grid_qty, '*')
-
-        return calc(part_1, part_2, '+')
+            return each_qty
 
     def unmatched_profit_calc(self, initial_index: int, current_index: int, all_prices: tuple[float], all_quantities: tuple[int],
                               init_pos_price: float, init_pos_qty: int, current_price: float) -> float:
@@ -2953,5 +2159,4 @@ class SmartGridAnalyzerFutures(Analyzer):
         return int(round(time.time() * 1000))
 
     def __del__(self):
-        print('\n{}: {} smart grid analyzer 实例被删除，释放资源\n'.format(self.stg_num, self.symbol_name))
-        pass
+        print('\n{}: {} market maker grid analyzer 实例被删除，释放资源\n'.format(self.stg_num, self.symbol_name))

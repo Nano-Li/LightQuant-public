@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# @Time : 2023/5/3 17:25
+# @Time : 2023/7/21 10:45
 # @Author : 
-# @File : HighFreqTriggerGridFuturesT.py 
+# @File : HighFreqTriggerGridFuturesBTC.py 
 # @Software: PyCharm
 import time
 import asyncio
@@ -14,7 +14,7 @@ from LightQuant.Executor import Executor
 from LightQuant.protocols.BinanceToken import BinanceToken as Token
 
 
-class HighFreqTriggerGridAnalyzerFuturesT(Analyzer):
+class HighFreqTriggerGridAnalyzerFuturesBTC(Analyzer):
     """
     基于高频网格开发的触发高频网格
     目前开发了挂单触发功能
@@ -584,11 +584,8 @@ class HighFreqTriggerGridAnalyzerFuturesT(Analyzer):
     def confirm_params(self, input_params: dict) -> None:
         self.symbol_name = input_params['symbol_name']
 
-        # self._my_executor.temp_reconnect()
-        asyncio.create_task(self._my_executor.temp_place_order())
-
-        # self._my_executor.start_single_contract_order_subscription(self.symbol_name)
-        # self._my_executor.start_single_contract_ticker_subscription(self.symbol_name)
+        self._my_executor.start_single_contract_order_subscription(self.symbol_name)
+        self._my_executor.start_single_contract_ticker_subscription(self.symbol_name)
 
     def derive_functional_variables(self) -> None:
         """
@@ -723,16 +720,6 @@ class HighFreqTriggerGridAnalyzerFuturesT(Analyzer):
             self.min_sell_order_num, self.max_sell_order_num = 6, 12
             self.buffer_buy_num, self.buffer_sell_num = 3, 3
 
-        # todo: 此处只考虑了单边挂单数量，可以合理化
-        max_allowed_order_num = int(self.entry_grid_price * 0.5 / self.grid_price_step)
-        if self.max_buy_order_num >= max_allowed_order_num:
-            self._log_info('\n*** ================================= ***\n')
-            self._log_info('价格偏移导致的挂单数量限制为 {} ! \n已自动减少缓冲网格数量，请留意交易情况!'.format(max_allowed_order_num))
-            self._log_info('\n*** ================================= ***\n')
-            self.min_buy_order_num, self.max_buy_order_num = int((max_allowed_order_num - 2) / 2), max_allowed_order_num - 2
-            self.min_sell_order_num, self.max_sell_order_num = int((max_allowed_order_num - 2) / 2), max_allowed_order_num - 2
-            self.buffer_buy_num, self.buffer_sell_num = 3, 3
-
         self._pre_update_text_task.cancel()
         self._update_text_task = asyncio.create_task(self._update_detail_info(interval_time=3))
 
@@ -752,12 +739,10 @@ class HighFreqTriggerGridAnalyzerFuturesT(Analyzer):
         self.current_symbol_price = self.entry_grid_price
 
         # 2. 开始撒网
-        # asyncio.create_task(self._layout_net())
+        asyncio.create_task(self._layout_net())
 
         # 3. 开启维护挂单任务
-        # self._fix_order_task = asyncio.create_task(self._order_fixer(interval_time=1800))
-
-        # self._my_executor.temp_reconnect()
+        # self._fix_order_task = asyncio.create_task(self._order_fixer(interval_time=60))
 
     # strategy methods
     async def _maker_market_post(self) -> None:
@@ -1451,7 +1436,7 @@ class HighFreqTriggerGridAnalyzerFuturesT(Analyzer):
                         await self.command_transmitter(trans_command=filling_batch_cmd, token=Token.TO_POST_BATCH_POC)
 
         # 5.最后根据需要校验仓差
-        if (self._trading_statistics['filled_buy_order_num'] + self._trading_statistics['filled_sell_order_num']) % 60 == 0:
+        if (self._trading_statistics['filled_buy_order_num'] + self._trading_statistics['filled_sell_order_num']) % 80 == 0:
 
             if self._fix_position_task:
                 self._fix_position_task: asyncio.coroutine
@@ -1697,43 +1682,43 @@ class HighFreqTriggerGridAnalyzerFuturesT(Analyzer):
         self._executing_order_fixing = True
 
         # 1. 价格偏移较大情况
-        # if self._x_grid_down_price < self.current_symbol_price < self._x_grid_up_price:
-        #     if abs(self.current_symbol_price - self.all_grid_price[self.critical_index]) > 10 * self.grid_price_step:
-        #         self._log_info('$$$ 价格偏离较大: 最新价 {}; 策略价 {}, 直接重新开启网格!'.format(self.current_symbol_price, self.all_grid_price[self.critical_index]))
-        #         # 关停maker市价功能
-        #         if self._maker_market_switch_on:
-        #             self._maker_market_switch_on = False
-        #             self._target_maker_quantity = 0
-        #             self._target_maker_side = None
-        #             self._finished_maker_quantity = 0
-        #             self._finished_maker_value = 0
-        #             self._exist_market_poc_order = False
-        #
-        #         # 撤销所有挂单
-        #         cancel_cmd = Token.ORDER_INFO.copy()
-        #         cancel_cmd['symbol'] = self.symbol_name
-        #         await self.command_transmitter(trans_command=cancel_cmd, token=Token.CANCEL_ALL)
-        #         await asyncio.sleep(1)
-        #
-        #         self.current_symbol_price = await self._my_executor.get_current_price(self.symbol_name)
-        #         for each_index, each_grid_price in enumerate(self.all_grid_price):
-        #             if each_grid_price <= self.current_symbol_price < (each_grid_price + self._x_price_abs_step):
-        #                 if self.current_symbol_price - each_grid_price <= self._x_price_abs_step / 2:
-        #                     self.critical_index = each_index
-        #                 else:
-        #                     self.critical_index = each_index + 1
-        #
-        #         self.derive_valid_position()
-        #
-        #         self._layout_complete = False
-        #         await self._layout_net()
-        #
-        #         self._log_info('$$$ 重启网格完成')
-        #         # 最后将相关变量归位
-        #         self._exist_failed_order_request = False
-        #         self._need_fix_order = False
-        #         self._executing_order_fixing = False
-        #         return
+        if self._x_grid_down_price < self.current_symbol_price < self._x_grid_up_price:
+            if abs(self.current_symbol_price - self.all_grid_price[self.critical_index]) > 10 * self.grid_price_step:
+                self._log_info('$$$ 价格偏离较大: 最新价 {}; 策略价 {}, 直接重新开启网格!'.format(self.current_symbol_price, self.all_grid_price[self.critical_index]))
+                # 关停maker市价功能
+                if self._maker_market_switch_on:
+                    self._maker_market_switch_on = False
+                    self._target_maker_quantity = 0
+                    self._target_maker_side = None
+                    self._finished_maker_quantity = 0
+                    self._finished_maker_value = 0
+                    self._exist_market_poc_order = False
+
+                # 撤销所有挂单
+                cancel_cmd = Token.ORDER_INFO.copy()
+                cancel_cmd['symbol'] = self.symbol_name
+                await self.command_transmitter(trans_command=cancel_cmd, token=Token.CANCEL_ALL)
+                await asyncio.sleep(1)
+
+                self.current_symbol_price = await self._my_executor.get_current_price(self.symbol_name)
+                for each_index, each_grid_price in enumerate(self.all_grid_price):
+                    if each_grid_price <= self.current_symbol_price < (each_grid_price + self._x_price_abs_step):
+                        if self.current_symbol_price - each_grid_price <= self._x_price_abs_step / 2:
+                            self.critical_index = each_index
+                        else:
+                            self.critical_index = each_index + 1
+
+                self.derive_valid_position()
+
+                self._layout_complete = False
+                await self._layout_net()
+
+                self._log_info('$$$ 重启网格完成')
+                # 最后将相关变量归位
+                self._exist_failed_order_request = False
+                self._need_fix_order = False
+                self._executing_order_fixing = False
+                return
 
         # 2. 价格无偏移情况
         account_orders_list, account_orders_list_id = await self._my_executor.get_open_orders(self.symbol_name)
@@ -2086,20 +2071,20 @@ class HighFreqTriggerGridAnalyzerFuturesT(Analyzer):
         self.previous_price = self.current_symbol_price
         self.current_symbol_price = recv_ticker_data['price']
 
-        # if self._accumulated_market_quantity != 0:
-        #     if abs(self._accumulated_market_quantity) > 20 * self.grid_each_qty:
-        #         self._log_info('*** 累计maker市价单仓位较大，需要市价交易')
-        #         if not self._maker_market_switch_on:
-        #             self._log_info('*** 市价执行已累计仓位 {} 张'.format(self._accumulated_market_quantity))
-        #             self._target_maker_side = self.BUY if self._accumulated_market_quantity > 0 else self.SELL
-        #             self._target_maker_quantity = abs(self._accumulated_market_quantity)
-        #             self._maker_market_switch_on = True
-        #             self._accumulated_market_quantity = 0
+        if self._accumulated_market_quantity != 0:
+            if abs(self._accumulated_market_quantity) > 16 * self.grid_each_qty:
+                self._log_info('*** 累计maker市价单仓位较大，需要市价交易')
+                if not self._maker_market_switch_on:
+                    self._log_info('*** 市价执行已累计仓位 {} 张'.format(self._accumulated_market_quantity))
+                    self._target_maker_side = self.BUY if self._accumulated_market_quantity > 0 else self.SELL
+                    self._target_maker_quantity = abs(self._accumulated_market_quantity)
+                    self._maker_market_switch_on = True
+                    self._accumulated_market_quantity = 0
 
         # 策略还在运行时，检查最新价格是否偏离过大，
         if self._is_trading:
             if self._x_grid_down_price < self.current_symbol_price < self._x_grid_up_price:
-                if abs(calc(self.current_symbol_price, self.all_grid_price[self.critical_index], '-')) > 2 * self.grid_price_step:
+                if abs(calc(self.current_symbol_price, self.all_grid_price[self.critical_index], '-')) > 5 * self.grid_price_step:
                     self._log_info('$$$ 检测到价格偏离过大，策略挂单出现问题')
                     self._need_fix_order = True
 
@@ -2111,9 +2096,9 @@ class HighFreqTriggerGridAnalyzerFuturesT(Analyzer):
                 self._log_info('检测到价格超出下边界!需要终止策略')
                 asyncio.create_task(self._terminate_trading(reason='价格超出网格下边界'))
 
-        # 开启maker市价开关，需要使用功能，临时取消这个功能
-        # if self._maker_market_switch_on:
-        #     await self._maker_market_post()
+        # 开启maker市价开关，需要使用功能
+        if self._maker_market_switch_on:
+            await self._maker_market_post()
 
         # 收到修正挂单请求，修正账户挂单，临时取消
         if self._need_fix_order:

@@ -144,6 +144,7 @@ class GateFuturesExecutor(Executor):
         操作：创建 client 等一些初始操作
         :return:
         """
+        print('{} 创建通道连接'.format(str(self)))
         if self._connected:
             return True
         # todo: client创建成功
@@ -188,7 +189,7 @@ class GateFuturesExecutor(Executor):
         断开与gate服务器的一切通讯
         :return:
         """
-        self._connected = False
+        self._connecasted = False
         self._websocket_connection.close()
         # self._websocket_client_connection.close()
 
@@ -447,11 +448,7 @@ class GateFuturesExecutor(Executor):
             amount=str(fund),
             sub_account_type='futures'
         )
-        try:
-            self._wallet_client.transfer_with_sub_account(sub_account_transfer)
-        except GateApiException as Ge:
-            print(f'账户 {user_id} 转移资金失败！')
-            raise Ge
+        self._wallet_client.transfer_with_sub_account(sub_account_transfer)
 
     # ## ==================================== all streams ==================================== ## #
     async def _user_order_socket_receiver(self, conn: gate_ws.Connection, res: gate_ws.WebSocketResponse) -> None:
@@ -856,7 +853,6 @@ class GateFuturesExecutor(Executor):
             if action_status['success']:
                 print('下单api登录成功')
             else:
-                print(f'下单api登录失败，请检查: {action_status}')
                 raise ConnectionError('下单api登录失败')
 
     async def _handle_user_futures_trade_data(self, order_data: dict) -> None:

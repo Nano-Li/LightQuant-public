@@ -40,6 +40,11 @@ class BinanceToken:
         'price': 0.00
     }
 
+    BOOK_TICKER_INFO = {
+        'ask': 0.0,
+        'bid': 0.0
+    }
+
     # 定义与 Analyzer 通信时的订单状态
     # 发送命令
     TO_POST_LIMIT = 'to_post_limit'

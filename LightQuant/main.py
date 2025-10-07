@@ -8,8 +8,8 @@
 """
 import os
 import sys
-import asyncio
 
+import asyncio
 import time
 import hmac
 import hashlib
@@ -24,9 +24,10 @@ from quamash import QEventLoop
 from PyQt5 import QtCore, QtGui
 from PyQt5.QtWidgets import QApplication
 from qdarkstyle.light.palette import LightPalette
-from LightQuant.ui.MainWindow import FinalWindow
-from LightQuant.sysout import PrintWindow
+from ui.MainWindow import FinalWindow
 
+
+sys.path.append('C:/MetaTrade')
 
 # 创建日志记录器
 logger = logging.getLogger('trade_logger')
@@ -115,7 +116,7 @@ def handle_trade_error(loop, context):
     logger.error('\n交易任务出错\n'.join(log_lines), exc_info=exc_info)
     if can_send_message():
         # print('do not send')
-        send_dingding_message('Main server trading error detected! plz check server and account status!')
+        send_dingding_message('server trading error detected! plz check code')
     else:
         print('detected server error, do not send msg')
 
@@ -123,8 +124,8 @@ def handle_trade_error(loop, context):
 if __name__ == '__main__':
     app = QApplication(sys.argv)
 
-    app.setStyleSheet(qdarkstyle.load_stylesheet_pyqt5())
-    # app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api='pyqt5', palette=LightPalette()))
+    # app.setStyleSheet(qdarkstyle.load_stylesheet_pyqt5())
+    app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api='pyqt5', palette=LightPalette()))
     # app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api='pyqt5'))
     QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling)
 
@@ -134,12 +135,9 @@ if __name__ == '__main__':
     # noinspection PyProtectedMember, PyUnresolvedReferences
     asyncio.events._set_running_loop(main_loop)
     trade_window = FinalWindow()
-    print_window = PrintWindow()
     trade_window.show()
-    print_window.show()
-
-    print(f'当前进程PID: {os.getpid()}')
 
     main_loop.run_forever()
     app.exec()
+    # todo: 绝大多数的操作需要用协程运行，尤其是包括sleep函数的操作，防止有操作时影响正在运行的策略
 

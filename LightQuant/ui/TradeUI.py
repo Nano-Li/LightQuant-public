@@ -299,6 +299,121 @@ class StoppedStgColumn(QGroupBox):
         print('Stopped stg column 实例被删除')
 
 
+class SubAccountColumn(QGroupBox):
+
+    # noinspection PyTypeChecker
+    def __init__(self, account_series: str = None):
+        super().__init__()
+        self.account_series: str = account_series
+
+        self.text_account_name: QLabel = None
+        # self.account_num = None
+        # showing trading data
+        self.num_total_asset: QLabel = None
+        self.num_margin: QLabel = None
+
+        # 设置点击响应
+        self._is_selected = False
+        self.clicked.connect(self._column_select)
+
+        self._init_setting()
+
+    def _init_setting(self):
+        self.setFixedHeight(60)
+        # self.setObjectName('stg_col_frame')
+        # todo: further study, more styles
+        # self.setStyleSheet("QWidget{border: 3px solid #FF0000;}")
+        self.setStyleSheet("QGroupBox{margin-top:0px;} QGroupBox:title {margin-top:0px;}")
+        # self.setStyleSheet("QGroupBox{margin-top:0px; border:1px solid gray;} QGroupBox:title {margin-top:0px;}")
+        # self.setLineWidth(3)
+        # self.setMidLineWidth(3)
+
+        # 整体为水平布局
+        column_layout = QHBoxLayout()
+        column_layout.setContentsMargins(0, 0, 0, 0)
+        column_layout.setSpacing(0)
+
+        # ==================== 账号文字部分 ==================== #
+        left_frame = QFrame(self)
+        left_frame.setFixedSize(320, 48)
+        # left_frame.setFrameStyle((QFrame.WinPanel | QFrame.Plain))
+
+        temp_font = QFont()
+        temp_font.setFamily('Aria')
+        temp_font.setPixelSize(20)
+
+        self.text_symbol_name = QLabel(f'账号 {self.account_series}', left_frame)
+        self.text_symbol_name.setFont(temp_font)
+        self.text_symbol_name.setGeometry(14, 9, 140, 30)
+
+        temp_font.setPixelSize(12)
+        text_total_asset = QLabel('资产：', left_frame)
+        text_total_asset.setFont(temp_font)
+        text_total_asset.setGeometry(180, 30, 50, 16)
+
+        self.num_total_asset = QLabel('0', left_frame)
+        self.num_total_asset.setFont(temp_font)
+        self.num_total_asset.setGeometry(230, 30, 60, 16)
+
+        # ==================== 右边部分 ==================== #
+        right_frame = QFrame()
+        right_frame.setFixedSize(160, 48)
+
+        temp_font.setPixelSize(12)
+        text_margin = QLabel('保证金：', right_frame)
+        text_margin.setFont(temp_font)
+        text_margin.setGeometry(30, 30, 50, 16)
+
+        self.num_margin = QLabel('0', right_frame)
+        self.num_margin.setFont(temp_font)
+        self.num_margin.setGeometry(80, 30, 60, 16)
+
+        column_layout.addWidget(left_frame)
+        column_layout.addStretch()
+        column_layout.addWidget(right_frame)
+
+        self.setLayout(column_layout)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+
+    def _column_select(self) -> None:
+        if self._is_selected:
+            self.turn_unselected_frame_mode()
+        else:
+            self.turn_selected_frame_mode()
+
+    def turn_selected_frame_mode(self) -> None:
+        """
+        该方框被选中，转换为选中模式，需要在外部被调用
+        :return:
+        """
+        self._is_selected = True
+        self.setStyleSheet("QGroupBox{margin-top:0px; border:1px solid gray;} QGroupBox:title {margin-top:0px;}")
+
+    def turn_unselected_frame_mode(self) -> None:
+        """
+        方框取消选中，转换为默认模式
+        :return:
+        """
+        self._is_selected = False
+        self.setStyleSheet("QGroupBox{margin-top:0px;} QGroupBox:title {margin-top:0px;}")
+
+    def renew_account_info(self, asset: str, margin: str) -> None:
+        self.num_total_asset.setText(asset)
+        self.num_margin.setText(margin)
+
+    def update_account_info(self, showing_info: str) -> None:
+        pass
+
+    def update_account_orders(self, appending_info: str) -> None:
+        pass
+
+    def __del__(self):
+        print('Running stg column 实例被删除')
+
+
 class DetailRegion(QDockWidget):
     """
     策略详情区域，显示单个策略的详细信息
@@ -756,6 +871,289 @@ class TradeUI(QFrame):
         print('交易UI被删除')    # todo: temp config to delete
 
 
+class AccountRegion(QVBoxLayout):
+    # noinspection PyTypeChecker
+    def __init__(self):
+        super().__init__()
+        self.setContentsMargins(8, 8, 8, 8)
+        self.column_layout: QVBoxLayout = QVBoxLayout()
+        self.column_layout.setAlignment(Qt.AlignTop)
+        self.column_layout.setDirection(QBoxLayout.BottomToTop)
+        # push buttons
+        self.btn_connect_api: QPushButton = None
+        self.stg_selector: QComboBox = None
+        self.btn_create_stg: QPushButton = None
+        self.btn_change_param: QPushButton = None
+        self.btn_initialize: QPushButton = None
+        self.btn_start_stg: QPushButton = None
+        self.btn_stop_stg: QPushButton = None
+
+        self.init_setting()
+
+    def init_setting(self):
+        # ==================== top ==================== #
+        top_content = QHBoxLayout()
+
+        temp_font = QFont()
+        temp_font.setFamily('Aria')
+        temp_font.setPixelSize(16)
+        # left title part
+        left_part = QFrame()
+        left_part.setFixedSize(180, 36)
+
+        region_title = QLabel('子账户列表', left_part)
+        region_title.setFont(temp_font)
+        region_title.setGeometry(3, 3, 80, 30)
+
+        temp_font.setPixelSize(12)
+        self.btn_connect_api = QPushButton('连接主账号API', left_part)
+        self.btn_connect_api.setFont(temp_font)
+        self.btn_connect_api.setGeometry(88, 6, 80, 24)
+        self.btn_connect_api.setAutoRepeat(False)
+
+        # right btn part
+        right_part = QFrame()
+        right_part.setFixedSize(600, 36)
+
+        self.stg_selector = QComboBox(right_part)
+        # self.stg_selector.setParent(right_part)
+        self.stg_selector.setFont(temp_font)
+        self.stg_selector.setGeometry(10, 6, 120, 24)
+        self.stg_selector.setEditable(True)
+        self.stg_selector.lineEdit().setAlignment(Qt.AlignCenter)
+        self.stg_selector.lineEdit().setReadOnly(True)
+        self.stg_selector.setStyleSheet("QAbstractItemView::item {height: 24px;}")
+        self.stg_selector.setView(QListView())
+        # self.stg_selector.addItems(['等差网格', '等比网格'])
+
+        self.btn_create_stg = QPushButton('创建策略', right_part)
+        self.btn_create_stg.setFont(temp_font)
+        self.btn_create_stg.setGeometry(144, 3, 90, 30)
+        self.btn_create_stg.setAutoRepeat(False)
+        # self.btn_create_stg.clicked.connect(self._create_new_stg)
+
+        self.btn_change_param = QPushButton('查看参数', right_part)
+        self.btn_change_param.setFont(temp_font)
+        self.btn_change_param.setGeometry(254, 3, 90, 30)
+        self.btn_change_param.setAutoRepeat(False)
+
+        self.btn_initialize = QPushButton('初始化', right_part)
+        self.btn_initialize.setFont(temp_font)
+        self.btn_initialize.setGeometry(356, 3, 90, 30)
+        self.btn_initialize.setAutoRepeat(False)
+
+        self.btn_start_stg = QPushButton('开始运行', right_part)
+        self.btn_start_stg.setFont(temp_font)
+        self.btn_start_stg.setGeometry(450, 3, 90, 30)
+        self.btn_start_stg.setAutoRepeat(False)
+
+        self.btn_stop_stg = QPushButton('停止', right_part)
+        self.btn_stop_stg.setFont(temp_font)
+        self.btn_stop_stg.setGeometry(520, 3, 60, 30)
+        self.btn_stop_stg.setAutoRepeat(False)
+
+        top_content.addWidget(left_part)
+        top_content.addStretch()
+        top_content.addWidget(right_part)
+
+        # ==================== body ==================== #
+        account_window = QScrollArea()
+        account_window.setWidgetResizable(True)
+        # trading_window.setMinimumWidth(450)
+        account_window.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        account_window_frame = QFrame()
+        self.column_layout.setContentsMargins(12, 12, 12, 12)
+        self.column_layout.setSpacing(16)
+
+        # for _ in range(12):
+        #     each_stg_column = RunningStgColumn('DOGEUSDT')
+        #     each_stg_column.stg_num = 'Stg' + str(_)
+        #     self.column_layout.addWidget(each_stg_column)
+
+        account_window_frame.setLayout(self.column_layout)
+        account_window.setWidget(account_window_frame)
+
+        self.addLayout(top_content)
+        self.addWidget(account_window)
+
+
+class MarketMakerUI(QFrame):
+    """
+    适用于多子账号架构的交易界面
+    """
+    # noinspection PyTypeChecker
+    def __init__(self):
+        super().__init__()
+        self.account_window = AccountRegion()
+        self.detail_region = DetailRegion()
+        self.order_region = OrderRegion()
+        # save all buttons
+        self.btn_connect_api: QPushButton = None
+        self.stg_selector: QComboBox = None
+        self.btn_create_stg: QPushButton = None
+        self.btn_change_param: QPushButton = None
+        self.btn_initialize: QPushButton = None
+        self.btn_start_stg: QPushButton = None
+        self.btn_stop_stg: QPushButton = None
+
+        self._set_buttons()
+
+        self.init_ui()
+        self.resize(1400, 800)
+        # self.showMaximized()
+
+        self.window_title = 'Trader'
+
+    def init_ui(self):
+        self.setObjectName('main_frame')
+        # todo: set proper frame color
+        # self.setStyleSheet("QFrame#main_frame{border:1px solid white;border-radius: 0px}")
+        main_container = QHBoxLayout()
+        main_container.setContentsMargins(0, 0, 0, 0)
+
+        # left_top = QFrame()
+        # left_top.setFrameShape((QFrame.Box | QFrame.Plain))
+        # left_top.setLayout(self.trading_window)
+        #
+        # left_bottom = QFrame()
+        # left_bottom.setFrameShape((QFrame.Box | QFrame.Plain))
+        # left_bottom.setLayout(self.traded_window)
+
+        # right_top = QFrame()
+        # right_top.setFrameShape(QFrame.StyledPanel)
+        right_top = QFrame()
+        right_top.setObjectName('right_top_region')
+        right_top.setStyleSheet("QFrame#right_top_region{border-radius: 0px;}")
+        right_top_layout = QVBoxLayout()
+        right_top_layout.setContentsMargins(0, 0, 0, 0)
+        right_top_layout.addWidget(self.detail_region)
+        right_top.setLayout(right_top_layout)
+        # right_top = DetailRegion()
+
+        # right_bottom = QFrame()
+        # right_bottom.setFrameShape(QFrame.StyledPanel)
+        right_bottom = QFrame()
+        right_bottom.setObjectName('right_bottom_region')
+        right_bottom.setStyleSheet("QFrame#right_bottom_region{border-radius: 0px;}")
+        right_bottom_layout = QVBoxLayout()
+        right_bottom_layout.setContentsMargins(0, 2, 0, 0)
+        right_bottom_layout.addWidget(self.order_region)
+        right_bottom.setLayout(right_bottom_layout)
+        # right_bottom = OrdersRegion()
+
+        split_width = 3
+        left_region = QFrame()
+        left_region.setObjectName('left_main_region')
+        left_region.setStyleSheet("QFrame#left_main_region{border-radius: 0px;}")
+        left_region_layout = QVBoxLayout()
+        left_region_layout.setContentsMargins(0, 0, 2, 0)
+
+        # left_splitter = QSplitter(Qt.Vertical)
+        # left_splitter.setHandleWidth(split_width)
+        # left_splitter.addWidget(left_top)
+        # left_splitter.addWidget(left_bottom)
+        # left_splitter.setSizes([480, 320])
+
+        # left_region_layout.addWidget(left_splitter)
+        left_region.setLayout(self.account_window)
+
+        right_region = QFrame()
+        right_region.setObjectName('right_main_region')
+        right_region.setStyleSheet("QFrame#right_main_region{border-radius: 0px;}")
+        right_region_layout = QVBoxLayout()
+        right_region_layout.setContentsMargins(2, 0, 0, 0)
+
+        right_splitter = QSplitter(Qt.Vertical)
+        right_splitter.setHandleWidth(split_width)
+        right_splitter.addWidget(right_top)
+        right_splitter.addWidget(right_bottom)
+        right_splitter.setSizes([350, 450])
+
+        right_region_layout.addWidget(right_splitter)
+        right_region.setLayout(right_region_layout)
+
+        center_splitter = QSplitter(Qt.Horizontal)
+        center_splitter.setHandleWidth(split_width)
+        center_splitter.addWidget(left_region)
+        center_splitter.addWidget(right_region)
+        center_splitter.setSizes([960, 440])
+
+        main_container.addWidget(center_splitter)
+        self.setLayout(main_container)
+
+    def _set_buttons(self):
+        """
+        存储并连接所有按钮控件
+        :return:
+        """
+        self.btn_connect_api = self.account_window.btn_connect_api
+        self.stg_selector = self.account_window.stg_selector
+        self.btn_create_stg = self.account_window.btn_create_stg
+        self.btn_change_param = self.account_window.btn_change_param
+        self.btn_initialize = self.account_window.btn_initialize
+        self.btn_start_stg = self.account_window.btn_start_stg
+        self.btn_stop_stg = self.account_window.btn_stop_stg
+
+        self.btn_connect_api.clicked.connect(self._pop_connect_api_dialog)
+        self.btn_create_stg.clicked.connect(self._create_stg)
+        self.btn_change_param.clicked.connect(self._check_param)
+        self.btn_initialize.clicked.connect(self._initialize_stg)
+        self.btn_start_stg.clicked.connect(self._start_stg)
+        self.btn_stop_stg.clicked.connect(self._stop_stg)
+
+    def set_window_title(self, title: str = None) -> None:
+        """
+        设置主窗口名称
+        :param title:
+        :return:
+        """
+        if title:
+            self.window_title = title
+        self.setWindowTitle(self.window_title)
+
+    def _block_window(self) -> None:
+        """
+        使窗口不可用，一般用于输入参数时
+        :return:
+        """
+        self.setEnabled(False)
+
+    def _enable_window(self) -> None:
+        self.setEnabled(True)
+
+    def _pop_connect_api_dialog(self):
+        pass
+
+    def _signal_receiver_api_dialog(self, info: int) -> None:
+        pass
+
+    def _create_stg(self):
+        pass
+
+    def _initialize_stg(self):
+        pass
+
+    def _check_param(self):
+        pass
+
+    def _start_stg(self):
+        pass
+
+    def _stop_stg(self):
+        pass
+
+    def _add_sub_account_col(self):
+        pass
+
+    def closeEvent(self, a0: QtGui.QCloseEvent) -> None:
+        print('做市UI被关闭')
+        super().closeEvent(a0)
+
+    def __del__(self):
+        print('做市UI被删除')    # todo: temp config to delete
+
+
 if __name__ == '__main__':
     import sys
     import qdarkstyle
@@ -770,6 +1168,6 @@ if __name__ == '__main__':
     # app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api='pyqt5'))
     QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling)
 
-    w = TradeUI()
+    w = MarketMakerUI()
     w.show()
     app.exec()

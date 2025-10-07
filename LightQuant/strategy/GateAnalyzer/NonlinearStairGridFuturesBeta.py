@@ -25,7 +25,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
     3.定时检查功能：一定次数后检查仓位，一定时间检查挂单
     4.仓位矫正功能：由于poc被驳回，仓位漂移，修改盘口挂单数量以矫正仓位 done
         仓位漂移来源：poc被驳回，未被完成的部分成交
-    5.部分成交挂单处理：随着交易时间增加，网格会逐渐累积只有部分成交的挂单，todo done
+    5.部分成交挂单处理：随着交易时间增加，网格会逐渐累积只有部分成交的挂单，
     6.价格偏离预警：最新价格与策略价格偏离过多，策略运行故障预警
 
     current doing: 高频仓位问题，额外缓冲挂单，适用于山寨翻倍的合理参考信息
@@ -41,7 +41,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
     MARKET_ORDER_ID = 99999999  # 市价下单的id，taker成交
     ENTRY_ORDER_ID = 99999998  # 触发挂单id
 
-    param_dict: dict = {        # todo: 考虑使用self实例化字典保存参数
+    param_dict: dict = {  # todo: 考虑使用self实例化字典保存参数
         'symbol_name': None,
         'up_price': None,
         'each_grid_qty': None,
@@ -202,7 +202,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
         # 市价挂单目标量和剩余量，均为正数表示绝对数量，用于记忆市价挂单交易数量作为比对，该功能不完全必要
         self._MARKET_ORDER_qty_left: int = 0
         self._MARKET_ORDER_qty_target: int = 0
-        self._MARKET_ORDER_value = 0          # 市价成交，已完成价值，用于最后求平均值
+        self._MARKET_ORDER_value = 0  # 市价成交，已完成价值，用于最后求平均值
 
         # 前一个最新ticker价格
         self.previous_price = 0
@@ -274,9 +274,6 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
         # 存储所有 coroutine
         # self._market_locker_task: asyncio.coroutine = None
         # self._fix_position_task: asyncio.coroutine = None
-
-        self.stg_num = None
-        self.stg_num_len = None
 
         self._is_trading = False  # todo: 修改至基类
 
@@ -670,8 +667,8 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
         # print(self.entry_grid_price)
         self.lower_step_price = calc(self.entry_grid_price, self._x_lower_price_step, '-')
         self.up_grid_num = int(calc(calc(self._x_grid_up_limit, self.entry_grid_price, '-'), self.grid_price_step, '/')) + 1
-        # 计算合理的缓冲台阶数量，上方100个网格数量的缓冲
-        self.upper_buffer_steps_num = max(int(calc(100, self.filling_grid_step_num, '/')), 5)
+        # 计算合理的缓冲台阶数量，上方100个网格数量的缓冲     # todo: 是否一开始就冲出了上界
+        self.upper_buffer_steps_num = max(int(calc(self.symbol_orders_limit_num, self.filling_grid_step_num, '/')), 5)
         # print('缓冲台阶数量 {}'.format(self.upper_buffer_steps_num))
         # 线性区域网格价格，包括缓冲台阶
         linear_grid_prices = tuple([calc(self.lower_step_price, calc(i, self.grid_price_step, '*'), '+')
@@ -749,11 +746,6 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
         if self._current_valid_position < 0:
             raise ValueError('仓位小于0，不合逻辑!!!')
 
-    def acquire_token(self, stg_code: str) -> None:
-        # todo: 考虑添加至基类
-        self.stg_num = stg_code
-        self.stg_num_len = len(stg_code)
-
     def stop(self) -> None:
         if self._is_waiting:
             # 策略未触发，直接手动停止，撤销一个挂单即可
@@ -792,7 +784,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
         self._my_logger.open_file(self.symbol_name)
         self._my_preserver = Preserver()
         self._my_preserver.acquire_user_id(self._my_executor.return_user_id())
-        self._my_preserver.open_file(self.symbol_name)      # todo: 改写并测试继承方法，使代码更美观
+        self._my_preserver.open_file(self.symbol_name)  # todo: 改写并测试继承方法，使代码更美观
 
         asyncio.create_task(self._my_executor.change_symbol_leverage(self.symbol_name, self.symbol_leverage))
 
@@ -834,7 +826,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
             self._log_info('maker fee rate: {}'.format(self.symbol_maker_fee))
             self._log_info('taker fee rate: {}'.format(self.symbol_taker_fee))
 
-        self._update_text_task = asyncio.create_task(self._update_detail_info(interval_time=3))
+        self._update_text_task = asyncio.create_task(self._update_detail_info(interval_time=1))
 
         self._init_account_position = 0
 
@@ -852,14 +844,13 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
 
         # 1. 设置初始市价买入数量
         if not self.trigger_start:
-
             await self._post_market_order(self.BUY, self.filling_quantity)
 
         # 2. 开始撒网
         asyncio.create_task(self._layout_net())
 
         # 3. 开启维护挂单任务
-        self._fix_order_task = asyncio.create_task(self._order_fixer(interval_time=1200))
+        self._fix_order_task = asyncio.create_task(self._order_fixer(interval_time=180))
 
     # strategy basic methods
     def _grid_stair_step_up(self) -> None:
@@ -1153,6 +1144,11 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
                                 posting_order['quantity'] = self.grid_each_qty
                                 self._log_info('挂卖  {:2} 单\t\t\t价格: {:<12}\tid: {:<10}'.format(str(each_num + 1), posting_order['price'], posting_order['id']))
 
+                                # if this_order_index % 10 == 0:
+                                #     self._log_info('___test error___')
+                                #     raise ValueError('test error')
+                                # else:
+                                #     self._log_info('___test good___')
                                 await self.command_transmitter(trans_command=posting_order, token=Token.TO_POST_POC)
                             break
                         else:
@@ -1362,7 +1358,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
                 else:
                     endpoint_index = self.parse_id(self.open_buy_orders[0]['id'])[0]
 
-                # 在超高频网格当中，可能一下子现存订单就非常少，需要一次补充很多挂单
+                # 在超高频网格当中，可能一下子现存订单就非常少，需要一次补充很多挂单     # todo: 在未来的Ultra策略中可以优化
                 instant_add_num = self.buffer_buy_num if (self.min_buy_order_num - open_buy_orders_num < self.buffer_buy_num) \
                     else self.max_buy_order_num - open_buy_orders_num - 5
 
@@ -1443,9 +1439,22 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
                         filling_batch_cmd['status'] = Token.TO_POST_BATCH_POC
                         await self.command_transmitter(trans_command=filling_batch_cmd, token=Token.TO_POST_BATCH_POC)
 
-        # 5.最后根据需要更新统计信息
-        if (self._trading_statistics['filled_buy_order_num'] + self._trading_statistics['filled_sell_order_num']) % 80 == 0:
+        # 5.最后，每次网格维护后，检查是否需要清理部分成交挂单
+        # self._clean_accumulated_partial_orders_beta()
+
+        # 6.最后根据需要更新统计信息
+        if (self._trading_statistics['filled_buy_order_num'] + self._trading_statistics['filled_sell_order_num']) % 40 == 0:
             self._need_adjust_pos = True
+            # if self._fix_position_task:
+            #     self._fix_position_task: asyncio.coroutine
+            #     if self._fix_position_task.done():
+            #         # 旧任务已完成，再次执行
+            #         self._fix_position_task = asyncio.create_task(self._fix_position())
+            #     else:
+            #         self._log_info('### 存在执行中的校验仓差任务，不开启新任务')
+            # else:
+            #     self._log_info('### 首次开启校验仓差任务')
+            #     self._fix_position_task = asyncio.create_task(self._fix_position())
 
     async def _maintainer_by_price(self) -> None:
         """
@@ -1730,7 +1739,6 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
             self._is_waiting, self._is_trading
         :return:
         """
-        # todo: work from here
         stg_param_dict = {
             'symbol_name': self.symbol_name,
             'up_price': self._x_grid_up_limit,
@@ -1763,7 +1771,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
         }
         self._my_preserver.preserve_strategy_info(strategy_info)
 
-    async def restart(self, stg_info: dict, save_file_name: str) -> bool:    # todo: 改为文件名
+    async def restart(self, stg_info: dict, save_file_name: str) -> bool:
         """
         使用已保存的策略信息重新开启策略
         重启网格相当于开启了一个新的网格，并重新计算
@@ -1775,7 +1783,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
             stg_params = stg_info['stg_params']
             stg_statistics = stg_info['stg_statistics']
 
-            self.symbol_name = stg_info['symbol_name']          # 在重启时也定义了实例的合约名称，此步多余
+            self.symbol_name = stg_info['symbol_name']  # 在重启时也定义了实例的合约名称，此步多余
             # 获取新的记录参数实例
             self._my_logger = LogRecorder()
             self._my_logger.open_file(self.symbol_name)
@@ -1849,11 +1857,11 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
             # 设置合理挂单数量
             self._reasonable_order_num_estimate()
 
-            self._my_preserver = Preserver()                    # todo: 重启失败虽然会移动文件，但是也清除了文件内容，逻辑有点乱，需要修改
+            self._my_preserver = Preserver()
             self._my_preserver.acquire_user_id(self._my_executor.return_user_id())
             self._my_preserver.use_existing_file(save_file_name)
 
-            self._update_text_task = asyncio.create_task(self._update_detail_info(interval_time=3))
+            self._update_text_task = asyncio.create_task(self._update_detail_info(interval_time=1))
 
             # 重启网格并获得正确仓位
             cancel_cmd = Token.ORDER_INFO.copy()
@@ -1870,7 +1878,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
 
             await self._layout_net()
 
-            self._fix_order_task = asyncio.create_task(self._order_fixer(interval_time=1200))
+            self._fix_order_task = asyncio.create_task(self._order_fixer(interval_time=180))
 
             self._log_info('$$$ 策略恢复: 网格重启完成')
             # 最后将相关变量归位，并需要调整仓位
@@ -2000,7 +2008,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
         :return:
         """
         start_t = self._running_loop.time()
-        current_account_qty = await self._my_executor.get_symbol_position(self.symbol_name)     # todo: 测试延时
+        current_account_qty = await self._my_executor.get_symbol_position(self.symbol_name)  # todo: 测试延时
         end_t = self._running_loop.time()
         elapsed_t_ms = int((end_t - start_t) * 1000)
         self._log_info('>>> 获取仓位耗时: {} ms'.format(elapsed_t_ms))
@@ -2061,8 +2069,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
         if self._cannot_check_open_orders:
             self._log_info('$$$ 检查挂单操作被禁止，等待下一回合')
             return
-        # 此处最少约有100ms的延时    todo: 测试延时
-        # todo: 检测挂单的同时，检测挂单是否部分成交并检查部分成交记录情况
+        # 此处最少约有100ms的延时
 
         # 1. 价格偏移较大情况
         if self.critical_index >= 1:
@@ -2274,7 +2281,8 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
         self._MARKET_ORDER_qty_left = self._MARKET_ORDER_qty_left - filled_size
         self._MARKET_ORDER_value = calc(self._MARKET_ORDER_value, calc(filled_size, float(order_data_dict['price']), '*'), '+')
         if self._MARKET_ORDER_qty_left > 0:
-            self._log_info('\n市价请求成交中，已完成 {} %'.format(str(round((self._MARKET_ORDER_qty_target - self._MARKET_ORDER_qty_left) / self._MARKET_ORDER_qty_target * 100, 1))))
+            self._log_info(
+                '\n市价请求成交中，已完成 {} %'.format(str(round((self._MARKET_ORDER_qty_target - self._MARKET_ORDER_qty_left) / self._MARKET_ORDER_qty_target * 100, 1))))
         elif self._MARKET_ORDER_qty_left == 0:
             avg_price = calc(self._MARKET_ORDER_value, self._MARKET_ORDER_qty_target, '/')
             self._log_info('\n市价挂单全部成交! 成交均价: {}\n'.format(str(avg_price)))
@@ -2302,7 +2310,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
 
         if self._adjusting_qty_left == 0:
             # 结束仓位修正并维护网格
-            self._log_info('\n### 修正挂单完全成交，仓位修正完成!!! ###\n')       # todo: may be too frequently to delete
+            self._log_info('\n### 修正挂单完全成交，仓位修正完成!!! ###\n')
 
             self.adjusting_index = self._pre_adjusting_index = -1
             self._adjusting_qty_target = self._adjusting_qty_left = 0
@@ -2388,7 +2396,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
         :return:
         """
         self._log_info('>>> ')
-        if not self._is_trading:    # 因为此时有可能人工手动停止
+        if not self._is_trading:  # 因为此时有可能人工手动停止
             return
         if self._doing_delay_task:
             self._log_info('\n>>> 上锁，不重复开启延时任务')
@@ -2399,7 +2407,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
         try:
             if self._need_fix_order:
                 self._log_info('\n>>> switch: 检查当前挂单')
-                await self._check_open_orders()       # 消耗约 100 ms
+                await self._check_open_orders()  # 消耗约 100 ms
                 # todo: 可以考虑分开写，使用两个延时器
                 return
 
@@ -2407,7 +2415,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
                 # 此时没有特殊挂单
                 if self._need_adjust_pos:
                     self._log_info('\n>>> 需要修正仓位')
-                    await self._check_position()      # 消耗约 100 ms
+                    await self._check_position()  # 消耗约 100 ms
 
                     if self._accumulated_pos_deviation == 0:
                         self._log_info('### 账户实际仓位正确，不需要修正\n')
@@ -2427,8 +2435,8 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
                                     self._log_info('### 等待下一回合修正')
 
                             else:
-                                self._log_info('### 修正买1单')     # todo: test print to delete, 该输出过于频繁
-                                adjusting_id = self.open_buy_orders[-1]['id']      # 买 1 订单
+                                self._log_info('### 修正买1单')  # todo: test print to delete, 该输出过于频繁
+                                adjusting_id = self.open_buy_orders[-1]['id']  # 买 1 订单
                                 self.adjusting_index = self.parse_id(adjusting_id)[0]
                                 self._adjusting_order_side = self.BUY
                                 if adjusting_id in self.partially_filled_orders.keys():
@@ -2456,8 +2464,8 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
                                 self._log_info('### 当前无卖挂单，等待下一回合')
                                 return
 
-                            self._log_info('### 修正卖1单')     # todo: test print to delete, 该输出过于频繁
-                            adjusting_id = self.open_sell_orders[0]['id']     # 卖 1 订单
+                            self._log_info('### 修正卖1单')  # todo: test print to delete, 该输出过于频繁
+                            adjusting_id = self.open_sell_orders[0]['id']  # 卖 1 订单
                             self.adjusting_index = self.parse_id(adjusting_id)[0]
                             self._adjusting_order_side = self.SELL
                             if adjusting_id in self.partially_filled_orders.keys():
@@ -2487,7 +2495,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
 
             else:
                 self._log_info('\n>>> 检查特殊挂单')
-                if abs(self.critical_index - self.adjusting_index) > min(10, self.min_buy_order_num, self.min_sell_order_num):        # todo: 测试市场，偏离10是否合理
+                if abs(self.critical_index - self.adjusting_index) > min(10, self.min_buy_order_num, self.min_sell_order_num):  # todo: 测试市场，偏离10是否合理
                     self._log_info('### 修正挂单距离遥远，二次修正，请注意套利收益!')
                     if self.adjusting_index < self.critical_index:
                         self._log_info('### 再次修正买1单')
@@ -2614,7 +2622,7 @@ class NonlinearStairGridAnalyzerFuturesBeta(Analyzer):
         elif recv_data_dict['status'] == Token.PARTIALLY_FILLED:
             self._log_info('\nerror: invalid info received, plz check code\n')
 
-        elif recv_data_dict['status'] == Token.ORDER_UPDATE:
+        elif recv_data_dict['status'] == Token.ORDER_UPDATE:        # 对于gate服务器，该收信有可能是订单部分成交或订单修改成功
             # 目前在该策略逻辑中，只有一种更新订单的情况即修改买1卖1订单的数量，其他的id都是部分成交，已由其他通道处理
             if self.adjusting_index == -1:
                 pass
