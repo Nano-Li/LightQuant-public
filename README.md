@@ -1,5 +1,5 @@
 # LightQuant
-/LightQuant project for standard server (t3a.m),Python版本3.10.10.
+LightQuant project for standard server (t3a.m),Python版本3.10.10.
 适用于标准服务器的稳定版量化交易系统。
 
 目前仅支持Gate合约，系统还在完善过程当中。
